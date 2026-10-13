@@ -341,7 +341,7 @@ def generate_lod_mesh(
         mod_norm.object = lod0_obj
         mod_norm.use_loop_data = True
         mod_norm.data_types_loops = {'CUSTOM_NORMAL'}
-        mod_norm.loop_mapping = 'POLYINTERP_LNORPROJ'
+        mod_norm.loop_mapping = 'POLYINTERP_NEAREST'
         apply_modifier_safely(context, new_obj, mod_norm.name)
 
     elif normal_strategy == 'WEIGHTED':
