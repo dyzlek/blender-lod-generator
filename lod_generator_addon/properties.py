@@ -1,0 +1,292 @@
+"""
+Data Models and Property Groups for Procedural LOD Generator.
+Declares scene-level settings and stats tracking for UI panels and operators.
+"""
+
+import math
+import bpy
+from bpy.props import (
+    IntProperty,
+    FloatProperty,
+    BoolProperty,
+    EnumProperty,
+    StringProperty,
+    CollectionProperty,
+    PointerProperty,
+)
+
+
+class LODStatItem(bpy.types.PropertyGroup):
+    """Stores per-level metrics for UI reporting."""
+    lod_name: StringProperty(name="Nom", default="")
+    lod_level: IntProperty(name="Niveau", default=0)
+    triangles: IntProperty(name="Triangles", default=0)
+    reduction_pct: FloatProperty(name="Réduction %", default=0.0)
+    screen_threshold: FloatProperty(name="Seuil d'écran", default=0.5)
+    culled_islands: IntProperty(name="Îlots culled", default=0)
+    repaired_uv_faces: IntProperty(name="Faces UV réparées", default=0)
+
+
+class LODGeneratorSettings(bpy.types.PropertyGroup):
+    """Global parameters for procedural LOD generation pipeline."""
+
+    # --- Général ---
+    lod_count: IntProperty(
+        name="Niveaux de LOD",
+        description="Nombre de niveaux de détail à générer après le LOD0 (ex: 3 génère LOD1, LOD2, LOD3)",
+        default=3,
+        min=1,
+        max=6
+    )
+
+    reduction_preset: EnumProperty(
+        name="Preset de réduction",
+        description="Formule mathématique de distribution polygonale",
+        items=[
+            ('EXPONENTIAL', "Exponentielle (0.5^k)", "Standard AAA : divise par 2 à chaque niveau (50%, 25%, 12.5%...)"),
+            ('LINEAR', "Linéaire", "Décroissance linéaire régulière"),
+            ('CINEMATIC', "Cinématique (0.7^k)", "Décroissance douce pour assets de héros (70%, 49%, 34%...)"),
+            ('CUSTOM', "Manuel / Personnalisé", "Ratios configurés manuellement par niveau")
+        ],
+        default='EXPONENTIAL'
+    )
+
+    custom_lod1_ratio: FloatProperty(name="LOD1 Ratio", default=0.50, min=0.01, max=1.0, subtype='PERCENTAGE')
+    custom_lod2_ratio: FloatProperty(name="LOD2 Ratio", default=0.25, min=0.01, max=1.0, subtype='PERCENTAGE')
+    custom_lod3_ratio: FloatProperty(name="LOD3 Ratio", default=0.125, min=0.01, max=1.0, subtype='PERCENTAGE')
+    custom_lod4_ratio: FloatProperty(name="LOD4 Ratio", default=0.06, min=0.01, max=1.0, subtype='PERCENTAGE')
+    custom_lod5_ratio: FloatProperty(name="LOD5 Ratio", default=0.03, min=0.01, max=1.0, subtype='PERCENTAGE')
+    custom_lod6_ratio: FloatProperty(name="LOD6 Ratio", default=0.01, min=0.005, max=1.0, subtype='PERCENTAGE')
+
+    generation_mode: EnumProperty(
+        name="Mode de génération",
+        description="Stratégie de dérivation géométrique",
+        items=[
+            ('PARALLEL', "Parallèle (depuis LOD0)", "Précision maximale, évite l'accumulation d'erreurs (Recommandé)"),
+            ('CASCADE', "Cascade (LODk-1 → LODk)", "Calcul incrémental ultra-rapide")
+        ],
+        default='PARALLEL'
+    )
+
+    # --- Préservation topologique & UVs ---
+    pre_triangulate: BoolProperty(
+        name="Pré-triangulation propre",
+        description="Triangule le modèle avant décimation (Beauty + Keep Normals) pour éliminer les N-Gons concaves et stries codes-barres",
+        default=True
+    )
+
+    use_delimit_uv: BoolProperty(
+        name="Verrouillage Delimit UV",
+        description="Active la barrière topologique C++ native delimit={'UV', 'MATERIAL', 'SEAM'} sur Decimate Collapse pour interdire les fusions à travers les coutures",
+        default=True
+    )
+
+    uv_border_curvature: BoolProperty(
+        name="Courbure 2D des Bordures UV",
+        description="Détecte les virages dans l'espace UV (> 5°) pour verrouiller les courbes concaves et empêcher les débordements hors texture",
+        default=True
+    )
+
+    bvh_repair_uv: BoolProperty(
+        name="Réparation Barycentrique BVH",
+        description="Détecte les triangles UV écrasés (Aire ≈ 0) ou retournés et répare leurs coordonnées via projection barycentrique depuis le LOD0",
+        default=True
+    )
+
+    split_weld_isolation: BoolProperty(
+        name="Isolation Split-Decimate-Weld",
+        description="Isole physiquement les îlots UV par Edge Split temporaire avant décimation et ressoude à distance infime",
+        default=False
+    )
+
+    preserve_uv_seams: FloatProperty(
+        name="Coutures UV",
+        description="Poids de protection injecté sur les sommets des coutures UV (W_uv)",
+        default=0.85,
+        min=0.0,
+        max=1.0
+    )
+
+    preserve_silhouette: FloatProperty(
+        name="Silhouette & Angles",
+        description="Poids de préservation des arêtes vives et de la courbure dièdre (W_curve)",
+        default=0.75,
+        min=0.0,
+        max=1.0
+    )
+
+    silhouette_angle: FloatProperty(
+        name="Angle silhouette seuil",
+        description="Angle dièdre minimal pour considérer une arête comme structurante",
+        default=math.radians(35.0),
+        min=math.radians(5.0),
+        max=math.radians(90.0),
+        subtype='ANGLE'
+    )
+
+    preserve_open_boundaries: FloatProperty(
+        name="Bordures ouvertes",
+        description="Poids de protection absolue des arêtes de bordures (W_boundary)",
+        default=1.0,
+        min=0.0,
+        max=1.0
+    )
+
+    preserve_material_borders: FloatProperty(
+        name="Frontières de matériaux",
+        description="Poids de protection des délimitations entre matériaux distincts",
+        default=0.90,
+        min=0.0,
+        max=1.0
+    )
+
+    preserve_skinning: FloatProperty(
+        name="Articulations / Skinning",
+        description="Poids de protection des articulations d'armature (coudes, genoux)",
+        default=0.70,
+        min=0.0,
+        max=1.0
+    )
+
+    relax_weights_per_lod: BoolProperty(
+        name="Relâchement par LOD",
+        description="Adoucit progressivement les contraintes UV et courbures sur LOD2 (W^2) et LOD3+",
+        default=True
+    )
+
+    # --- Optimisation & Culling ---
+    pre_planar_dissolve: BoolProperty(
+        name="Pré-nettoyage planaire",
+        description="Dissout les faces coplanaires avant QEM uniquement pour les surfaces architecturales plates (Désactiver sur surfaces organiques/courbes)",
+        default=False
+    )
+
+    planar_angle_limit: FloatProperty(
+        name="Angle planaire limite",
+        description="Angle maximal entre faces pour la dissolution planaire (<= 0.5° pour éviter de courber les N-Gons)",
+        default=math.radians(0.5),
+        min=math.radians(0.1),
+        max=math.radians(5.0),
+        subtype='ANGLE'
+    )
+
+    cull_small_parts: BoolProperty(
+        name="Culling petits fragments",
+        description="Supprime les îlots détachés isolés (vis, rivets, boulons) sur LOD2 et LOD3+",
+        default=True
+    )
+
+    cull_threshold: FloatProperty(
+        name="Seuil culling (%)",
+        description="Rayon relatif maximal d'un îlot pour être supprimé sur LOD2 (%)",
+        default=2.5,
+        min=0.1,
+        max=25.0
+    )
+
+    # --- Ombrage & Normales ---
+    normal_strategy: EnumProperty(
+        name="Stratégie de normales",
+        description="Méthode de restauration de l'ombrage pour éliminer le popping lumineux",
+        items=[
+            ('TRANSFER', "Data Transfer (LOD0)", "Projette les Custom Split Normals du LOD0 (Recommandé)"),
+            ('WEIGHTED', "Weighted Normals", "Génère des normales pondérées par l'aire"),
+            ('NONE', "Aucun", "Normales standard recalculées")
+        ],
+        default='TRANSFER'
+    )
+
+    # --- Sortie Moteur & Colliders ---
+    setup_lod_group: BoolProperty(
+        name="Hiérarchie 'LodGroup'",
+        description="Crée un parent Empty configuré avec fbx_type = 'LodGroup' (reconnu par Unreal et Unity)",
+        default=True
+    )
+
+    generate_collider: BoolProperty(
+        name="Générer Collider",
+        description="Crée automatiquement une enveloppe de collision optimisée pour moteur",
+        default=False
+    )
+
+    collider_type: EnumProperty(
+        name="Type de collider",
+        items=[
+            ('UCX', "UCX_ (Convex Hull)", "Enveloppe convexe pour Unreal Engine et Unity"),
+            ('UBX', "UBX_ (Boîte orientée)", "Boîte englobante orientée")
+        ],
+        default='UCX'
+    )
+
+    # --- Visualisation & Viewport ---
+    is_exploded: BoolProperty(
+        name="Vue éclatée",
+        description="Aligne les LODs côte à côte sur l'axe X pour comparaison visuelle",
+        default=False
+    )
+
+    explode_spacing: FloatProperty(
+        name="Espacement vue éclatée",
+        description="Facteur d'espacement basé sur la largeur de la bounding box",
+        default=1.5,
+        min=0.5,
+        max=5.0
+    )
+
+    is_distance_sim_active: BoolProperty(
+        name="Simulation distance active",
+        default=False
+    )
+
+    hud_overlay_enabled: BoolProperty(
+        name="HUD statistiques viewport",
+        description="Affiche le compteur de triangles et le gain mémoire dans le viewport 3D",
+        default=False
+    )
+
+    keep_protection_mask: BoolProperty(
+        name="Conserver masque de protection",
+        description="Conserve le Vertex Group '_LOD_Protection_Mask' sur les meshes pour debug",
+        default=False
+    )
+
+    # --- Exportation ---
+    export_path: StringProperty(
+        name="Dossier d'export",
+        description="Dossier de destination pour les fichiers exportés",
+        subtype='DIR_PATH',
+        default="//"
+    )
+
+    export_format: EnumProperty(
+        name="Format d'export",
+        items=[
+            ('FBX', "FBX (.fbx)", "Standard Unreal Engine & Unity avec LodGroup"),
+            ('GLTF', "glTF (.glb)", "Standard Godot & WebXR")
+        ],
+        default='FBX'
+    )
+
+    # --- Données de session ---
+    stats_items: CollectionProperty(type=LODStatItem)
+    base_asset_name: StringProperty(default="")
+    lod0_initial_triangles: IntProperty(default=0)
+
+
+classes = (
+    LODStatItem,
+    LODGeneratorSettings,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.lod_generator_settings = PointerProperty(type=LODGeneratorSettings)
+
+
+def unregister():
+    if hasattr(bpy.types.Scene, "lod_generator_settings"):
+        del bpy.types.Scene.lod_generator_settings
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
