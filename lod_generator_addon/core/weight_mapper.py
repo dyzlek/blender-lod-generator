@@ -8,6 +8,44 @@ from ..utils.math_helpers import clamp, calculate_uv_angle_deviation
 PROTECTION_VG_NAME = "_LOD_Protection_Mask"
 
 
+def mark_uv_discontinuities_as_seams(bm: bmesh.types.BMesh, epsilon: float = 1e-4) -> int:
+    """
+    Scans all edges in BMesh and explicitly marks e.seam = True
+    whenever UV loop coordinates diverge between two adjacent faces.
+    Essential for mod_qem.delimit={'SEAM', 'UV'} and split_edges to operate reliably
+    on imported meshes where UV seams are not pre-marked.
+    """
+    uv_layer = bm.loops.layers.uv.active
+    if not uv_layer:
+        return 0
+
+    marked_count = 0
+    for e in bm.edges:
+        if e.seam:
+            continue
+        if len(e.link_faces) == 2:
+            f0, f1 = e.link_faces[0], e.link_faces[1]
+            vA, vB = e.verts[0], e.verts[1]
+
+            uv0_A = uv0_B = uv1_A = uv1_B = None
+            for lp in f0.loops:
+                if lp.vert == vA:
+                    uv0_A = lp[uv_layer].uv
+                elif lp.vert == vB:
+                    uv0_B = lp[uv_layer].uv
+            for lp in f1.loops:
+                if lp.vert == vA:
+                    uv1_A = lp[uv_layer].uv
+                elif lp.vert == vB:
+                    uv1_B = lp[uv_layer].uv
+
+            if uv0_A and uv1_A and uv0_B and uv1_B:
+                if (uv0_A - uv1_A).length > epsilon or (uv0_B - uv1_B).length > epsilon:
+                    e.seam = True
+                    marked_count += 1
+    return marked_count
+
+
 def compute_vertex_protection_weights(
     bm: bmesh.types.BMesh,
     obj: bpy.types.Object | None = None,
@@ -30,6 +68,9 @@ def compute_vertex_protection_weights(
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
 
+    # Automatically identify and mark all physical UV cuts as seams
+    mark_uv_discontinuities_as_seams(bm)
+
     vert_count = len(bm.verts)
     weights = [0.0] * vert_count
 
@@ -47,11 +88,11 @@ def compute_vertex_protection_weights(
     eff_sil_angle = silhouette_angle_rad
 
     if lod_level >= 3 and relax_weights:
-        # On aggressive LODs (LOD3+), release UV and material constraints to save polycount
-        eff_preserve_uv = 0.0
-        eff_preserve_mat = 0.0
-        # Only preserve very sharp structural angles (> 60 degrees)
-        eff_sil_angle = max(silhouette_angle_rad, math.radians(60.0))
+        # Do not drop to 0.0, otherwise UV islands merge and tear textures (black diamonds).
+        # Maintain a floor of 0.5 to allow sliding along seams without collapsing across them.
+        eff_preserve_uv = max(0.5, preserve_uv * 0.6)
+        eff_preserve_mat = max(0.5, preserve_material * 0.6)
+        eff_sil_angle = max(silhouette_angle_rad, math.radians(50.0))
 
     for idx, v in enumerate(bm.verts):
         w_boundary = 0.0
@@ -93,30 +134,39 @@ def compute_vertex_protection_weights(
 
             # 2b. Protection of 2D UV border curvature (turns > 5 degrees)
             if uv_border_curvature and uv_layer and (is_uv_seam or w_boundary > 0.0):
-                border_uv_dirs = []
-                for e in v.link_edges:
-                    is_b_edge = (len(e.link_faces) == 1) or e.seam
-                    if is_b_edge:
-                        other_v = e.other_vert(v)
-                        for f in e.link_faces:
-                            lp_curr = None
-                            lp_other = None
-                            for lp in f.loops:
-                                if lp.vert == v: lp_curr = lp
-                                elif lp.vert == other_v: lp_other = lp
-                            if lp_curr and lp_other:
-                                d = lp_other[uv_layer].uv - lp_curr[uv_layer].uv
-                                if d.length > 1e-6:
-                                    border_uv_dirs.append(d)
-
-                if len(border_uv_dirs) >= 2:
-                    dev = calculate_uv_angle_deviation(
-                        Vector((border_uv_dirs[0].x, border_uv_dirs[0].y, 0.0)),
-                        Vector((border_uv_dirs[1].x, border_uv_dirs[1].y, 0.0))
-                    )
-                    # If border curves > 5 degrees, lock vertex to prevent cutting outside texture
-                    if dev > math.radians(5.0):
-                        w_uv_curve = 1.0
+                # Inspect each incident face: if it contains two border/seam edges incident to v,
+                # they represent consecutive boundary segments within the SAME UV island.
+                for f in v.link_faces:
+                    b_edges_in_face = [
+                        e for e in f.edges
+                        if v in e.verts and (e.seam or len(e.link_faces) == 1)
+                    ]
+                    if len(b_edges_in_face) >= 2:
+                        lp_v = None
+                        for lp in f.loops:
+                            if lp.vert == v:
+                                lp_v = lp
+                                break
+                        if lp_v:
+                            uv_v = lp_v[uv_layer].uv
+                            dirs = []
+                            for be in b_edges_in_face[:2]:
+                                other_v = be.other_vert(v)
+                                for lp in f.loops:
+                                    if lp.vert == other_v:
+                                        d = lp[uv_layer].uv - uv_v
+                                        if d.length > 1e-6:
+                                            dirs.append(d)
+                                        break
+                            if len(dirs) == 2:
+                                dev = calculate_uv_angle_deviation(
+                                    Vector((dirs[0].x, dirs[0].y, 0.0)),
+                                    Vector((dirs[1].x, dirs[1].y, 0.0))
+                                )
+                                # If border curves > 5 degrees, lock vertex to prevent cutting outside texture
+                                if dev > math.radians(5.0):
+                                    w_uv_curve = 1.0
+                                    break
 
         # --- 3. Material Boundary Check ---
         if eff_preserve_mat > 0.0 and len(v.link_faces) > 1:
@@ -226,7 +276,9 @@ def apply_protection_mask_to_object(
         lod_level=lod_level,
         relax_weights=relax_weights
     )
-
+    # Persist marked seams onto the mesh
+    bm.to_mesh(obj.data)
+    obj.data.update()
     bm.free()
 
     for idx, w in enumerate(weights):

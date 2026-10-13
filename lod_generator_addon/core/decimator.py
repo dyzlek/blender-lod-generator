@@ -17,7 +17,11 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.geometry import barycentric_transform
 from .analyzer import find_connected_islands, clean_mesh_topology
-from .weight_mapper import apply_protection_mask_to_object, PROTECTION_VG_NAME
+from .weight_mapper import (
+    apply_protection_mask_to_object,
+    PROTECTION_VG_NAME,
+    mark_uv_discontinuities_as_seams
+)
 from ..utils.math_helpers import (
     clamp,
     get_triangulated_face_count,
@@ -259,6 +263,17 @@ def generate_lod_mesh(
         mod_planar.delimit = {'UV', 'MATERIAL', 'SEAM', 'SHARP'}
         apply_modifier_safely(context, new_obj, mod_planar.name)
 
+    # Pre-mark UV discontinuities as seams so that both physical isolation and Delimit detect all UV cuts
+    if use_delimit_uv and new_obj.data.uv_layers:
+        bm_seam = bmesh.new()
+        bm_seam.from_mesh(new_obj.data)
+        bm_seam.edges.ensure_lookup_table()
+        marked = mark_uv_discontinuities_as_seams(bm_seam)
+        if marked > 0:
+            bm_seam.to_mesh(new_obj.data)
+            new_obj.data.update()
+        bm_seam.free()
+
     # 5. Optional Split-Decimate-Weld Physical Isolation
     if split_weld_isolation:
         bm_split = bmesh.new()
@@ -299,12 +314,9 @@ def generate_lod_mesh(
         mod_qem.invert_vertex_group = True
         mod_qem.vertex_group_factor = 1.0
 
-        # Native C++ boundary barrier (Rule A)
-        if use_delimit_uv and lod_level <= 2:
+        # Native C++ boundary barrier: keep 'UV' on ALL LOD levels to prevent bridges between UV islands
+        if use_delimit_uv:
             mod_qem.delimit = {'UV', 'MATERIAL', 'SEAM'}
-        elif use_delimit_uv and lod_level >= 3:
-            # Relax UV on LOD3+ while preserving materials & seams
-            mod_qem.delimit = {'MATERIAL', 'SEAM'}
 
         apply_modifier_safely(context, new_obj, mod_qem.name)
 

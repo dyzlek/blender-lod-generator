@@ -347,6 +347,37 @@ def test_uv_preservation_suite():
     bpy.data.objects.remove(obj_tgt, do_unlink=True)
     bpy.data.meshes.remove(mesh_tgt)
     print("  Reparation BVH : Triangulation source, aspect ratio et echantillonnage interieur valides [OK]")
+
+    # 4. Test mark_uv_discontinuities_as_seams and LOD3 floor (Issue 2)
+    from lod_generator_addon.core.weight_mapper import mark_uv_discontinuities_as_seams, compute_vertex_protection_weights
+    bm_seam_test = bmesh.new()
+    s0 = bm_seam_test.verts.new((0.0, 0.0, 0.0))
+    s1 = bm_seam_test.verts.new((1.0, 0.0, 0.0))
+    s2 = bm_seam_test.verts.new((1.0, 1.0, 0.0))
+    s3 = bm_seam_test.verts.new((0.0, 1.0, 0.0))
+    f_left = bm_seam_test.faces.new((s0, s1, s2))
+    f_right = bm_seam_test.faces.new((s0, s2, s3))
+    uv_l_test = bm_seam_test.loops.layers.uv.new("UVMap")
+    # Shared edge between s0 and s2
+    # Island 1
+    f_left.loops[0][uv_l_test].uv = (0.0, 0.0)
+    f_left.loops[1][uv_l_test].uv = (0.5, 0.0)
+    f_left.loops[2][uv_l_test].uv = (0.5, 0.5)
+    # Island 2 (offset in UV space, simulating a texture seam without explicit mark)
+    f_right.loops[0][uv_l_test].uv = (0.7, 0.7)
+    f_right.loops[1][uv_l_test].uv = (1.0, 1.0)
+    f_right.loops[2][uv_l_test].uv = (0.7, 1.0)
+
+    marked_seams = mark_uv_discontinuities_as_seams(bm_seam_test)
+    assert marked_seams == 1, f"L'arete de coupure UV aurait du etre marquee en seam (marked={marked_seams})"
+    shared_edge = bm_seam_test.edges.get((s0, s2))
+    assert shared_edge and shared_edge.seam, "L'arete partagee doit avoir e.seam == True"
+
+    # Verify LOD3 protection weights maintain floor >= 0.5 on seams
+    weights_lod3 = compute_vertex_protection_weights(bm_seam_test, lod_level=3, relax_weights=True)
+    assert weights_lod3[s0.index] >= 0.5, f"Le sommet de couture au LOD3 doit conserver un poids >= 0.5 (w={weights_lod3[s0.index]})"
+    bm_seam_test.free()
+    print("  Detection coutures UV & plancher LOD3 (w >= 0.5) valides [OK]")
     print("[OK] Validation mathematique du module de preservation des UVs.")
 
 
