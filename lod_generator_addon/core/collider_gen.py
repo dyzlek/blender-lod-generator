@@ -27,7 +27,10 @@ def get_or_create_collider_material() -> bpy.types.Material:
         node_bsdf.inputs['Alpha'].default_value = 0.35
         node_bsdf.inputs['Roughness'].default_value = 0.5
         tree.links.new(node_bsdf.outputs['BSDF'], node_out.inputs['Surface'])
-        mat.blend_method = 'BLEND'
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = 'BLENDED'
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = 'BLEND'
     return mat
 
 
@@ -38,10 +41,13 @@ def generate_convex_hull_collider(context, source_obj: bpy.types.Object, base_na
     """
     collider_name = f"UCX_{base_name}_01"
 
-    # Remove existing collider if present
+    # Remove existing collider if present and purge orphan mesh data
     existing = bpy.data.objects.get(collider_name)
     if existing:
+        old_mesh = existing.data if existing.type == 'MESH' else None
         bpy.data.objects.remove(existing, do_unlink=True)
+        if old_mesh and old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
 
     mesh_data = bpy.data.meshes.new(f"{collider_name}_Mesh")
     collider_obj = bpy.data.objects.new(collider_name, mesh_data)
@@ -98,7 +104,10 @@ def generate_box_collider(context, source_obj: bpy.types.Object, base_name: str)
 
     existing = bpy.data.objects.get(collider_name)
     if existing:
+        old_mesh = existing.data if existing.type == 'MESH' else None
         bpy.data.objects.remove(existing, do_unlink=True)
+        if old_mesh and old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
 
     min_co, max_co, dimensions = calculate_bounding_box(source_obj)
     center = (min_co + max_co) * 0.5

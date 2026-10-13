@@ -81,10 +81,13 @@ class LOD_OT_generate(bpy.types.Operator):
         for k in range(1, settings.lod_count + 1):
             lod_name = f"{base_name}_LOD{k}"
 
-            # Remove previous object with this name if exists
+            # Remove previous object with this name if exists and purge orphan mesh data
             old_obj = bpy.data.objects.get(lod_name)
             if old_obj and old_obj != lod0_obj:
+                old_mesh = old_obj.data if old_obj.type == 'MESH' else None
                 bpy.data.objects.remove(old_obj, do_unlink=True)
+                if old_mesh and old_mesh.users == 0:
+                    bpy.data.meshes.remove(old_mesh)
 
             source_for_pass = lod0_obj if settings.generation_mode == 'PARALLEL' else prev_obj
             target_ratio = ratios[k - 1]
@@ -228,7 +231,10 @@ class LOD_OT_clear_lods(bpy.types.Operator):
             to_delete.append(empty_obj)
 
         for obj in to_delete:
+            old_mesh = obj.data if obj.type == 'MESH' else None
             bpy.data.objects.remove(obj, do_unlink=True)
+            if old_mesh and old_mesh.users == 0:
+                bpy.data.meshes.remove(old_mesh)
 
         settings.stats_items.clear()
         settings.is_exploded = False

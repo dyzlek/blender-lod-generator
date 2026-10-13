@@ -237,6 +237,14 @@ def generate_lod_mesh(
     # Link to active collection temporarily
     context.collection.objects.link(new_obj)
 
+    # Normalize scale on duplicate mesh if non-uniform to ensure accurate metric thresholds
+    if (new_obj.scale - Vector((1.0, 1.0, 1.0))).length > 1e-5:
+        from mathutils import Matrix
+        scale_mat = Matrix.Diagonal((*new_obj.scale, 1.0))
+        new_mesh.transform(scale_mat)
+        new_mesh.update()
+        new_obj.scale = Vector((1.0, 1.0, 1.0))
+
     # 2. Pass 0 — Clean Pre-Triangulation (Beauty + Keep Normals)
     # Eliminates non-planar quads and concave N-Gons to prevent barcode UV artifacts
     if pre_triangulate:

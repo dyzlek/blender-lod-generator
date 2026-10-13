@@ -394,7 +394,13 @@ def test_cleanup():
     assert bpy.data.objects.get(f"{base_name}_LOD3") is None, "LOD3 non supprimé !"
     assert bpy.data.objects.get(f"LODGroup_{base_name}") is None, "Empty LODGroup non supprimé !"
     assert bpy.data.objects.get(f"UCX_{base_name}_01") is None, "Collider non supprimé !"
-    print("✓ Nettoyage et réinitialisation validés.")
+
+    # Verify no orphan mesh data blocks remain in memory (Issue 4)
+    assert bpy.data.meshes.get(f"{base_name}_LOD1_Mesh") is None, "Mesh LOD1_Mesh orphelin dans bpy.data.meshes !"
+    assert bpy.data.meshes.get(f"{base_name}_LOD2_Mesh") is None, "Mesh LOD2_Mesh orphelin dans bpy.data.meshes !"
+    assert bpy.data.meshes.get(f"{base_name}_LOD3_Mesh") is None, "Mesh LOD3_Mesh orphelin dans bpy.data.meshes !"
+    assert bpy.data.meshes.get(f"UCX_{base_name}_01_Mesh") is None, "Mesh UCX orphelin dans bpy.data.meshes !"
+    print("✓ Nettoyage et purge des maillages orphelins validés.")
 
 
 def main():
