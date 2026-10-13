@@ -84,8 +84,8 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
     """
     Scans the decimated mesh for UV foldovers or degenerated UV faces (e.g. barcode artifacts
     where UV area is near zero while 3D area is non-zero).
-    Uses a BVHTree constructed on LOD0 to find corresponding surface coordinates
-    and re-projects clean barycentric UVs.
+    Uses a BVHTree constructed on a pre-triangulated copy of LOD0 to find corresponding surface coordinates
+    and re-projects clean barycentric UVs sampled from the interior of the face.
     Returns the number of repaired faces.
     """
     if not target_obj or not lod0_obj or not target_obj.data.uv_layers:
@@ -93,6 +93,8 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
 
     bm0 = bmesh.new()
     bm0.from_mesh(lod0_obj.data)
+    # Triangulate bm0 to guarantee that every source face f0 has exactly 3 vertices
+    bmesh.ops.triangulate(bm0, faces=bm0.faces)
     bm0.faces.ensure_lookup_table()
     bm0.verts.ensure_lookup_table()
 
@@ -124,29 +126,36 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
         lp0, lp1, lp2 = f.loops[0], f.loops[1], f.loops[2]
         uv0, uv1, uv2 = lp0[uv_layer_target].uv, lp1[uv_layer_target].uv, lp2[uv_layer_target].uv
 
-        area_uv = calculate_uv_signed_area(uv0, uv1, uv2)
+        area_uv = abs(calculate_uv_signed_area(uv0, uv1, uv2))
         area_3d = calculate_triangle_3d_area(v0, v1, v2)
 
-        # Check for flattened/degenerate UVs (barcode artifact) or extreme foldovers
-        is_corrupted = (abs(area_uv) < 1e-6 and area_3d > 1e-5)
+        # 2D Aspect Ratio: a triangle is a barcode artifact only if area_uv is nearly zero or
+        # flattened beyond 99.99% relative to its maximum UV edge length
+        max_uv_edge = max((uv1 - uv0).length, (uv2 - uv1).length, (uv0 - uv2).length)
+        is_barcode = (max_uv_edge > 1e-4 and (2.0 * area_uv / (max_uv_edge ** 2)) < 1e-4)
+        is_zero_uv = (area_uv < 1e-10 and area_3d > 1e-5)
 
-        if is_corrupted:
-            for loop in f.loops:
-                loc, norm, face_idx, dist = bvh0.find_nearest(loop.vert.co)
-                if face_idx is not None and face_idx < len(bm0.faces):
-                    f0 = bm0.faces[face_idx]
-                    if len(f0.verts) >= 3:
-                        pA = f0.verts[0].co
-                        pB = f0.verts[1].co
-                        pC = f0.verts[2].co
-                        uvA = Vector((f0.loops[0][uv_layer0].uv.x, f0.loops[0][uv_layer0].uv.y, 0.0))
-                        uvB = Vector((f0.loops[1][uv_layer0].uv.x, f0.loops[1][uv_layer0].uv.y, 0.0))
-                        uvC = Vector((f0.loops[2][uv_layer0].uv.x, f0.loops[2][uv_layer0].uv.y, 0.0))
+        if is_barcode or is_zero_uv:
+            # Locate source face at the geometric center of the 3D triangle to eliminate seam ambiguity
+            face_center = (v0 + v1 + v2) / 3.0
+            _, _, center_face_idx, _ = bvh0.find_nearest(face_center)
 
+            if center_face_idx is not None and center_face_idx < len(bm0.faces):
+                f0 = bm0.faces[center_face_idx]
+                pA, pB, pC = f0.verts[0].co, f0.verts[1].co, f0.verts[2].co
+                uvA = Vector((f0.loops[0][uv_layer0].uv.x, f0.loops[0][uv_layer0].uv.y, 0.0))
+                uvB = Vector((f0.loops[1][uv_layer0].uv.x, f0.loops[1][uv_layer0].uv.y, 0.0))
+                uvC = Vector((f0.loops[2][uv_layer0].uv.x, f0.loops[2][uv_layer0].uv.y, 0.0))
+
+                for loop in f.loops:
+                    # Inward sampling: slight pull (5%) towards face center prevents jumping over seams
+                    sample_pt = loop.vert.co.lerp(face_center, 0.05)
+                    loc, _, _, _ = bvh0.find_nearest(sample_pt)
+                    if loc is not None:
                         uv_repaired = barycentric_transform(loc, pA, pB, pC, uvA, uvB, uvC)
                         loop[uv_layer_target].uv = uv_repaired.xy
 
-            repaired_count += 1
+                repaired_count += 1
 
     if repaired_count > 0:
         bm_target.to_mesh(target_obj.data)

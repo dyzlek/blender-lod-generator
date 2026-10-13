@@ -292,9 +292,62 @@ def test_uv_preservation_suite():
     dev_turn = calculate_uv_angle_deviation(dir_straight1, dir_turn)
     assert abs(dev_turn - math.radians(90.0)) < 1e-4, f"Déviation d'un virage 90° erronée : {dev_turn}"
 
-    print("  Calcul d'aire signée 2D : Normal=0.5, Inversé=-0.5, Dégénéré (Code-barres) ≈ 0.0")
-    print("  Déviation angulaire 2D UV : Ligne droite = 0.0°, Virage à 90° = 90.0°")
-    print("✓ Validation mathématique du module de préservation des UVs.")
+    print("  Calcul d'aire signee 2D : Normal=0.5, Inverse=-0.5, Degenere (Code-barres) ~ 0.0")
+    print("  Deviation angulaire 2D UV : Ligne droite = 0.0 deg, Virage a 90 deg = 90.0 deg")
+
+    # 3. Test repair_corrupted_uvs_via_bvh (Issue 1)
+    from lod_generator_addon.core.decimator import repair_corrupted_uvs_via_bvh
+    mesh_src = bpy.data.meshes.new("TestUV_LOD0")
+    obj_src = bpy.data.objects.new("TestUV_LOD0", mesh_src)
+    bpy.context.collection.objects.link(obj_src)
+    bm_s = bmesh.new()
+    vA = bm_s.verts.new((0.0, 0.0, 0.0))
+    vB = bm_s.verts.new((1.0, 0.0, 0.0))
+    vC = bm_s.verts.new((1.0, 1.0, 0.0))
+    vD = bm_s.verts.new((0.0, 1.0, 0.0))
+    f_src = bm_s.faces.new((vA, vB, vC, vD))
+    uv_l = bm_s.loops.layers.uv.new("UVMap")
+    f_src.loops[0][uv_l].uv = (0.0, 0.0)
+    f_src.loops[1][uv_l].uv = (1.0, 0.0)
+    f_src.loops[2][uv_l].uv = (1.0, 1.0)
+    f_src.loops[3][uv_l].uv = (0.0, 1.0)
+    bm_s.to_mesh(mesh_src)
+    bm_s.free()
+
+    mesh_tgt = bpy.data.meshes.new("TestUV_Target")
+    obj_tgt = bpy.data.objects.new("TestUV_Target", mesh_tgt)
+    bpy.context.collection.objects.link(obj_tgt)
+    bm_t = bmesh.new()
+    t0 = bm_t.verts.new((0.0, 0.0, 0.0))
+    t1 = bm_t.verts.new((1.0, 0.0, 0.0))
+    t2 = bm_t.verts.new((0.0, 1.0, 0.0))
+    f_tgt = bm_t.faces.new((t0, t1, t2))
+    uv_lt = bm_t.loops.layers.uv.new("UVMap")
+    # Degenerate collinear UVs (code-barre)
+    f_tgt.loops[0][uv_lt].uv = (0.0, 0.0)
+    f_tgt.loops[1][uv_lt].uv = (0.5, 0.0)
+    f_tgt.loops[2][uv_lt].uv = (1.0, 0.0)
+    bm_t.to_mesh(mesh_tgt)
+    bm_t.free()
+
+    repaired = repair_corrupted_uvs_via_bvh(obj_tgt, obj_src)
+    assert repaired == 1, f"Le triangle degenere aurait du etre repare (repaired={repaired})"
+
+    bm_check = bmesh.new()
+    bm_check.from_mesh(obj_tgt.data)
+    bm_check.faces.ensure_lookup_table()
+    uv_c = bm_check.loops.layers.uv.active
+    uv_res = [l[uv_c].uv for l in bm_check.faces[0].loops]
+    area_repaired = abs(calculate_uv_signed_area(uv_res[0], uv_res[1], uv_res[2]))
+    assert area_repaired > 1e-4, f"L'aire UV reparee doit etre saine (>1e-4), trouvee: {area_repaired}"
+    bm_check.free()
+
+    bpy.data.objects.remove(obj_src, do_unlink=True)
+    bpy.data.meshes.remove(mesh_src)
+    bpy.data.objects.remove(obj_tgt, do_unlink=True)
+    bpy.data.meshes.remove(mesh_tgt)
+    print("  Reparation BVH : Triangulation source, aspect ratio et echantillonnage interieur valides [OK]")
+    print("[OK] Validation mathematique du module de preservation des UVs.")
 
 
 def test_cleanup():
