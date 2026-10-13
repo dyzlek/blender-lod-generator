@@ -6,7 +6,7 @@ BFS island culling, QEM edge collapse, custom normal projection, and LodGroup Em
 
 bl_info = {
     "name": "Procedural LOD Generator Pro",
-    "author": "Antigravity",
+    "author": "Dylan",
     "version": (1, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (N) > LOD Generator",
