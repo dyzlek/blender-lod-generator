@@ -418,6 +418,224 @@ def test_uv_preservation_suite():
     print("[OK] Validation mathematique du module de preservation des UVs.")
 
 
+def _make_sphere(name, subdivisions=4):
+    mesh = bpy.data.meshes.new(f"{name}_Mesh")
+    bm = bmesh.new()
+    bmesh.ops.create_icosphere(bm, subdivisions=subdivisions, radius=1.0)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.uv_layers.new(name="UVMap")
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def _remove_object(obj):
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _select_only(obj):
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+
+
+def _bumpy_sphere(name, subdivisions=5):
+    """Icosphere with a radial ripple: real detail for error budgets and normal bakes."""
+    obj = _make_sphere(name, subdivisions)
+    for v in obj.data.vertices:
+        n = v.co.normalized()
+        v.co = n * (1.0 + 0.04 * math.sin(12 * n.x) * math.sin(12 * n.y) * math.sin(12 * n.z))
+    mat = bpy.data.materials.new(f"{name}_Mat")
+    mat.use_nodes = True
+    obj.data.materials.append(mat)
+    for p in obj.data.polygons:
+        p.use_smooth = True
+    return obj
+
+
+def test_error_budget():
+    print("\n--- Test 12: Budget d'erreur et taille ecran (v1.2, #11) ---")
+    from lod_generator_addon.core.decimator import find_ratio_for_error
+    from lod_generator_addon.core.error_metrics import measure_deviation, screen_size_to_error
+    from lod_generator_addon.utils.settings_map import pipeline_kwargs
+    from lod_generator_addon.utils.math_helpers import get_triangulated_face_count
+
+    src = _bumpy_sphere("TestBudget_LOD0")
+    settings = bpy.context.scene.lod_generator_settings
+    tris = get_triangulated_face_count(src)
+    kwargs = pipeline_kwargs(settings)
+
+    # Budget plus large -> ratio plus petit
+    tight, tight_err = find_ratio_for_error(bpy.context, src, src, 0.004, 1, tris, **kwargs)
+    loose, loose_err = find_ratio_for_error(bpy.context, src, src, 0.03, 1, tris, **kwargs)
+    assert tight_err <= 0.004 and loose_err <= 0.03, "Budget d'erreur non respecte par la recherche !"
+    assert loose < tight, f"Un budget plus large devrait reduire davantage ({loose:.3f} >= {tight:.3f})"
+
+    # Pipeline complet en mode budget : chaque LOD respecte son budget
+    _select_only(src)
+    settings.lod_count = 3
+    settings.reduction_mode = 'ERROR'
+    settings.max_error = 0.004
+    settings.error_growth = 2.0
+    assert bpy.ops.lod.generate() == {'FINISHED'}
+    items = list(settings.stats_items)
+    for item in items[1:]:
+        assert item.error_budget > 0.0
+        assert item.deviation <= item.error_budget * 1.001, (
+            f"{item.lod_name} : ecart {item.deviation:.4f} > budget {item.error_budget:.4f}")
+    assert items[1].triangles >= items[2].triangles >= items[3].triangles, "Triangles non decroissants !"
+    lod1 = bpy.data.objects["TestBudget_LOD1"]
+    assert abs(measure_deviation(lod1, src) - items[1].deviation) < 1e-6
+
+    # Mode taille ecran : erreur = diametre * px / (taille * hauteur)
+    assert abs(screen_size_to_error(2.0, 0.25, 1.0, 1000) - 0.008) < 1e-9
+    settings.reduction_mode = 'SCREEN'
+    _select_only(src)
+    assert bpy.ops.lod.generate() == {'FINISHED'}
+    for item in list(settings.stats_items)[1:]:
+        assert item.deviation <= item.error_budget * 1.001
+
+    settings.reduction_mode = 'RATIO'
+    bpy.ops.lod.clear_lods()
+    _remove_object(src)
+    print(f"  budget 4 mm -> ratio {tight:.3f}, budget 30 mm -> ratio {loose:.3f} [OK]")
+    print("✓ Budget d'erreur et mode taille ecran valides.")
+
+
+def test_remesh():
+    print("\n--- Test 13: Remesh Voxel / QuadriFlow avant decimation (v1.2, #14) ---")
+    from lod_generator_addon.core.decimator import generate_lod_mesh
+    from lod_generator_addon.core.analyzer import find_connected_islands
+    from lod_generator_addon.core.remesher import remesh_object
+    from lod_generator_addon.utils.math_helpers import get_triangulated_face_count
+
+    # Kitbash sale : deux cubes qui se chevauchent + une petite boule interne, 2 materiaux
+    mesh = bpy.data.meshes.new("TestDirty_Mesh")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    geom = bmesh.ops.create_cube(bm, size=1.0)
+    bmesh.ops.translate(bm, verts=geom["verts"], vec=(0.5, 0.3, 0.2))
+    geom = bmesh.ops.create_icosphere(bm, subdivisions=2, radius=0.2)
+    for f in bm.faces:
+        f.material_index = 1 if f.calc_center_median().x > 0.6 else 0
+    bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=3, use_grid_fill=True)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.uv_layers.new(name="UVMap")
+    mesh.materials.append(bpy.data.materials.new("TestDirty_A"))
+    mesh.materials.append(bpy.data.materials.new("TestDirty_B"))
+    src = bpy.data.objects.new("TestDirty_LOD0", mesh)
+    bpy.context.scene.collection.objects.link(src)
+
+    bm = bmesh.new()
+    bm.from_mesh(src.data)
+    islands_before = len(find_connected_islands(bm))
+    bm.free()
+    assert islands_before == 3
+
+    tris = get_triangulated_face_count(src)
+    lod, _ = generate_lod_mesh(bpy.context, src, src, "TestDirty_LOD1", 0.5, 1, tris,
+                               remesh_mode='VOXEL', remesh_voxel_pct=3.0, cull_small_parts=False)
+    bm = bmesh.new()
+    bm.from_mesh(lod.data)
+    islands_after = len(find_connected_islands(bm))
+    bm.free()
+    assert islands_after == 1, f"Remesh voxel : {islands_after} ilots au lieu de 1"
+    assert "UVMap" in lod.data.uv_layers, "UVs perdues par le remesh !"
+    assert {p.material_index for p in lod.data.polygons} == {0, 1}, "Index de materiaux perdus !"
+    assert len(lod.data.materials) == 2
+    _remove_object(lod)
+
+    # QuadriFlow (ou repli voxel) sur une sphere propre
+    sphere = _make_sphere("TestQuadri", subdivisions=3)
+    faces_before = len(sphere.data.polygons)
+    used = remesh_object(bpy.context, sphere, 'QUADRIFLOW', quadriflow_ratio=0.5)
+    assert used in {'QUADRIFLOW', 'VOXEL'} and len(sphere.data.polygons) != faces_before
+    _remove_object(sphere)
+    _remove_object(src)
+    print(f"  ilots {islands_before} -> {islands_after}, QuadriFlow -> {used} [OK]")
+    print("✓ Remesh avant decimation valide (UVs et materiaux conserves).")
+
+
+def test_bake_and_impostor():
+    print("\n--- Test 14: Bake normales & AO + imposteur billboard (v1.2, #12 #13) ---")
+    import numpy as np
+
+    src = _bumpy_sphere("TestBake_LOD0", subdivisions=5)
+    lod0_mat = src.data.materials[0]
+    lod0_nodes = len(lod0_mat.node_tree.nodes)
+    scenes_before = len(bpy.data.scenes)
+    cameras_before = len(bpy.data.cameras)
+
+    settings = bpy.context.scene.lod_generator_settings
+    settings.lod_count = 3
+    settings.reduction_mode = 'RATIO'
+    settings.reduction_preset = 'EXPONENTIAL'
+    settings.bake_enabled = True
+    settings.bake_from_level = 3
+    settings.bake_resolution = '256'
+    settings.bake_ao = True
+    settings.bake_ao_samples = 2
+    settings.impostor_enabled = True
+    settings.impostor_views = '8'
+    settings.impostor_resolution = 32
+    settings.impostor_engine = 'WORKBENCH'
+    engine_before = bpy.context.scene.render.engine
+
+    _select_only(src)
+    assert bpy.ops.lod.generate() == {'FINISHED'}
+
+    # Bake : maps creees, non uniformes, branchees ; LOD0 et LOD1/2 inchanges
+    lod3 = bpy.data.objects["TestBake_LOD3"]
+    normal = bpy.data.images.get("TestBake_LOD3_Normal")
+    ao = bpy.data.images.get("TestBake_LOD3_AO")
+    assert normal and ao and normal.packed_file and ao.packed_file, "Maps bakees absentes ou non empaquetees !"
+    pixels = np.empty(len(normal.pixels), dtype=np.float32)
+    normal.pixels.foreach_get(pixels)
+    assert pixels.reshape(-1, 4)[:, 0].std() > 0.01, "Normal map plate (aucun rayon n'a touche LOD0) !"
+    apx = np.empty(len(ao.pixels), dtype=np.float32)
+    ao.pixels.foreach_get(apx)
+    ao_values = apx.reshape(-1, 4)[:, 0]
+    assert (ao_values == 0.0).mean() < 0.5 and ao_values.max() > 0.5, "AO vide ou noire !"
+    mat3 = lod3.data.materials[0]
+    assert mat3 is not lod0_mat and mat3.name.startswith("TestBake_LOD3_")
+    assert any(n.type == 'NORMAL_MAP' for n in mat3.node_tree.nodes)
+    assert len(lod0_mat.node_tree.nodes) == lod0_nodes, "Materiau de LOD0 modifie par le bake !"
+    assert bpy.data.objects["TestBake_LOD1"].data.materials[0] is lod0_mat
+    assert bpy.context.scene.render.engine == engine_before, "Moteur de rendu non restaure !"
+
+    # Imposteur : LOD4, 8 quads, atlas 3x3 cases, alpha, aucune donnee temporaire
+    imp = bpy.data.objects.get("TestBake_LOD4")
+    assert imp is not None and len(imp.data.polygons) == 8, "Imposteur absent ou mal forme !"
+    atlas = bpy.data.images.get("TestBake_LOD4_ImpostorAtlas")
+    assert atlas and tuple(atlas.size) == (96, 96), f"Atlas inattendu : {atlas and tuple(atlas.size)}"
+    apix = np.empty(len(atlas.pixels), dtype=np.float32)
+    atlas.pixels.foreach_get(apix)
+    alpha = apix.reshape(-1, 4)[:, 3]
+    assert alpha.max() > 0.5 and alpha.min() < 0.01, "Atlas sans silhouette ou sans transparence !"
+    assert len(bpy.data.scenes) == scenes_before and len(bpy.data.cameras) == cameras_before, \
+        "Scene ou camera temporaire laissee !"
+    assert imp.parent and imp.parent.name == "LODGroup_TestBake", "Imposteur hors du LodGroup !"
+    assert [i.lod_name for i in settings.stats_items][-1] == "TestBake_LOD4"
+
+    # Nettoyage : objets, materiaux et images des LODs supprimes
+    bpy.ops.lod.clear_lods()
+    leftovers = [b.name for b in list(bpy.data.materials) + list(bpy.data.images)
+                 if b.name.startswith("TestBake_LOD") and not b.name.startswith("TestBake_LOD0")]
+    assert not leftovers, f"Donnees orphelines apres nettoyage : {leftovers}"
+
+    settings.bake_enabled = False
+    settings.impostor_enabled = False
+    _remove_object(src)
+    print("  normal + AO bakes (256 px), imposteur 8 vues (atlas 96x96) [OK]")
+    print("✓ Bake et imposteur valides, LOD0 intact, aucune donnee temporaire.")
+
+
 def test_double_walled_shell():
     print("\n--- Test 8b: Coque a double paroi (ballon, solidify) ---")
     from lod_generator_addon.core.decimator import generate_lod_mesh
@@ -487,6 +705,9 @@ def main():
         test_uv_preservation_suite()
         test_double_walled_shell()
         test_cleanup()
+        test_error_budget()
+        test_remesh()
+        test_bake_and_impostor()
 
         print("\n" + "=" * 70)
         print("  TOUS LES TESTS SONT PASSES AVEC SUCCES.")

@@ -64,6 +64,16 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
 
         box_cfg.prop(settings, "generation_mode")
 
+        box_cfg.prop(settings, "reduction_mode")
+        if settings.reduction_mode == 'ERROR':
+            col_err = box_cfg.column(align=True)
+            col_err.prop(settings, "max_error")
+            col_err.prop(settings, "error_growth")
+        elif settings.reduction_mode == 'SCREEN':
+            col_err = box_cfg.column(align=True)
+            col_err.prop(settings, "pixel_error")
+            col_err.prop(settings, "screen_height_px")
+
         # --- 3. Préservation des UVs & Éradication des Artefacts ---
         box_uv = layout.box()
         box_uv.label(text="3. Protection UVs & Anti-Artefacts", icon='UV')
@@ -99,6 +109,15 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
         box_opt.prop(settings, "cull_small_parts")
         if settings.cull_small_parts:
             box_opt.prop(settings, "cull_threshold")
+        box_opt.prop(settings, "remesh_mode")
+        if settings.remesh_mode != 'NONE':
+            col_rm = box_opt.column(align=True)
+            if settings.remesh_mode == 'VOXEL':
+                col_rm.prop(settings, "remesh_voxel_pct")
+            else:
+                col_rm.prop(settings, "remesh_quadriflow_ratio", slider=True)
+                col_rm.prop(settings, "remesh_voxel_pct", text="Voxel (repli) %")
+            col_rm.prop(settings, "remesh_from_level")
 
         # --- 6. Ombrage & Sortie ---
         box_out = layout.box()
@@ -108,6 +127,23 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
         box_out.prop(settings, "generate_collider")
         if settings.generate_collider:
             box_out.prop(settings, "collider_type")
+
+        box_out.prop(settings, "bake_enabled")
+        if settings.bake_enabled:
+            col_bk = box_out.column(align=True)
+            col_bk.prop(settings, "bake_from_level")
+            col_bk.prop(settings, "bake_resolution")
+            col_bk.prop(settings, "bake_ao")
+            if settings.bake_ao:
+                col_bk.prop(settings, "bake_ao_samples")
+            col_bk.prop(settings, "bake_dedicated_uv")
+
+        box_out.prop(settings, "impostor_enabled")
+        if settings.impostor_enabled:
+            col_imp = box_out.column(align=True)
+            col_imp.prop(settings, "impostor_views")
+            col_imp.prop(settings, "impostor_resolution")
+            col_imp.prop(settings, "impostor_engine")
 
         # --- Action Buttons ---
         col_action = layout.column(align=True)
@@ -141,6 +177,7 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
             header_row.label(text="Triangles")
             header_row.label(text="Gain %")
             header_row.label(text="Seuil Écran")
+            header_row.label(text="Écart")
 
             for item in settings.stats_items:
                 r = box_stats.row()
@@ -148,6 +185,14 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
                 r.label(text=f"{item.triangles:,}")
                 r.label(text=f"-{item.reduction_pct:.1f}%")
                 r.label(text=f"{item.screen_threshold*100:.1f}%")
+                if item.lod_level == 0:
+                    r.label(text="-")
+                elif item.is_impostor:
+                    r.label(text="billboard")
+                else:
+                    sub = r.row()
+                    sub.alert = item.error_budget > 0.0 and item.deviation > item.error_budget * 1.001
+                    sub.label(text=f"{item.deviation * 1000:.2f} mm")
 
             # Show UV repair count if any occurred
             total_repaired = sum(item.repaired_uv_faces for item in settings.stats_items)

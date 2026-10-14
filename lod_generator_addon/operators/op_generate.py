@@ -6,10 +6,14 @@ and stats collection.
 
 import bpy
 from ..core.analyzer import audit_mesh
-from ..core.decimator import generate_lod_mesh
+from ..core.decimator import generate_lod_mesh, find_ratio_for_error
+from ..core.error_metrics import measure_deviation, level_error_budget
+from ..core.baker import bake_lod_maps
+from ..core.impostor import generate_impostor
+from ..utils.settings_map import pipeline_kwargs
 from ..core.weight_mapper import apply_protection_mask_to_object, PROTECTION_VG_NAME
 from ..core.collider_gen import generate_convex_hull_collider, generate_box_collider
-from ..utils.hierarchy import get_base_name, setup_lod_group_empty, get_or_create_collection
+from ..utils.hierarchy import get_base_name, setup_lod_group_empty, get_or_create_collection, purge_orphan_lod_data
 from ..utils.math_helpers import (
     calculate_ratios,
     get_triangulated_face_count,
@@ -76,6 +80,8 @@ class LOD_OT_generate(bpy.types.Operator):
 
         created_lods = [lod0_obj]
         prev_obj = lod0_obj
+        kwargs = pipeline_kwargs(settings)
+        prev_ratio = 1.0
 
         # Generation loop
         for k in range(1, settings.lod_count + 1):
@@ -84,13 +90,21 @@ class LOD_OT_generate(bpy.types.Operator):
             # Remove previous object with this name if exists and purge orphan mesh data
             old_obj = bpy.data.objects.get(lod_name)
             if old_obj and old_obj != lod0_obj:
-                old_mesh = old_obj.data if old_obj.type == 'MESH' else None
-                bpy.data.objects.remove(old_obj, do_unlink=True)
-                if old_mesh and old_mesh.users == 0:
-                    bpy.data.meshes.remove(old_mesh)
+                _remove_object(old_obj)
 
             source_for_pass = lod0_obj if settings.generation_mode == 'PARALLEL' else prev_obj
-            target_ratio = ratios[k - 1]
+
+            # Error budget / screen size: search the smallest ratio within the budget
+            budget = 0.0
+            if settings.reduction_mode == 'RATIO':
+                target_ratio = ratios[k - 1]
+            else:
+                budget = level_error_budget(settings, k, lod0_obj, screen_thresholds)
+                target_ratio, _ = find_ratio_for_error(
+                    context, source_for_pass, lod0_obj, budget, k, original_triangles,
+                    max_ratio=prev_ratio, **kwargs
+                )
+            prev_ratio = target_ratio
 
             new_lod_obj, stats = generate_lod_mesh(
                 context=context,
@@ -100,24 +114,7 @@ class LOD_OT_generate(bpy.types.Operator):
                 target_ratio=target_ratio,
                 lod_level=k,
                 original_lod0_triangles=original_triangles,
-                pre_triangulate=settings.pre_triangulate,
-                use_delimit_uv=settings.use_delimit_uv,
-                uv_border_curvature=settings.uv_border_curvature,
-                bvh_repair_uv=settings.bvh_repair_uv,
-                split_weld_isolation=settings.split_weld_isolation,
-                preserve_uv=settings.preserve_uv_seams,
-                preserve_silhouette=settings.preserve_silhouette,
-                silhouette_angle_rad=settings.silhouette_angle,
-                preserve_boundary=settings.preserve_open_boundaries,
-                preserve_material=settings.preserve_material_borders,
-                preserve_skinning=settings.preserve_skinning,
-                relax_weights=settings.relax_weights_per_lod,
-                pre_planar_dissolve=settings.pre_planar_dissolve,
-                planar_angle_limit_rad=settings.planar_angle_limit,
-                cull_small_parts=settings.cull_small_parts,
-                cull_threshold_pct=settings.cull_threshold,
-                normal_strategy=settings.normal_strategy,
-                keep_protection_mask=settings.keep_protection_mask
+                **kwargs
             )
 
             created_lods.append(new_lod_obj)
@@ -131,7 +128,49 @@ class LOD_OT_generate(bpy.types.Operator):
             stat_entry.screen_threshold = screen_thresholds[k] if k < len(screen_thresholds) else 0.05
             stat_entry.culled_islands = stats["culled_islands"]
             stat_entry.repaired_uv_faces = stats.get("repaired_uvs", 0)
+            stat_entry.deviation = measure_deviation(new_lod_obj, lod0_obj)
+            stat_entry.error_budget = budget
 
+        # Normal & AO bake on distant LODs
+        if settings.bake_enabled:
+            for k in range(settings.bake_from_level, settings.lod_count + 1):
+                bake_lod_maps(
+                    context, created_lods[k], lod0_obj,
+                    resolution=int(settings.bake_resolution),
+                    bake_ao=settings.bake_ao,
+                    dedicated_uv=settings.bake_dedicated_uv,
+                    ao_samples=settings.bake_ao_samples,
+                )
+
+        # Billboard impostor as the last level
+        if settings.impostor_enabled:
+            level = settings.lod_count + 1
+            name = f"{base_name}_LOD{level}"
+            old_obj = bpy.data.objects.get(name)
+            if old_obj and old_obj != lod0_obj:
+                _remove_object(old_obj)
+            impostor = generate_impostor(
+                context, lod0_obj, name,
+                views=int(settings.impostor_views),
+                resolution=settings.impostor_resolution,
+                engine=settings.impostor_engine,
+            )
+            triangles = get_triangulated_face_count(impostor)
+            reduction = round((1.0 - triangles / max(1, original_triangles)) * 100.0, 1)
+            created_lods.append(impostor)
+            stats = {"triangles": triangles, "reduction_pct": reduction}
+            stat_entry = settings.stats_items.add()
+            stat_entry.lod_name = name
+            stat_entry.lod_level = level
+            stat_entry.triangles = triangles
+            stat_entry.reduction_pct = reduction
+            stat_entry.screen_threshold = screen_thresholds[-1] * 0.5
+            stat_entry.is_impostor = True
+
+        # Materials and maps of replaced LODs are no longer used
+        purge_orphan_lod_data(base_name)
+
+        # Optional Collider Generation
         # Optional Collider Generation
         collider_obj = None
         if settings.generate_collider:
@@ -156,6 +195,14 @@ class LOD_OT_generate(bpy.types.Operator):
             f"LOD0: {original_triangles} tris -> {created_lods[-1].name}: {stats['triangles']} tris (-{stats['reduction_pct']}%)"
         )
         return {'FINISHED'}
+
+
+def _remove_object(obj):
+    """Removes an object and its mesh when no longer used."""
+    mesh = obj.data if obj.type == 'MESH' else None
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
 
 
 class LOD_OT_visualize_mask(bpy.types.Operator):
@@ -238,6 +285,8 @@ class LOD_OT_clear_lods(bpy.types.Operator):
 
         settings.stats_items.clear()
         settings.is_exploded = False
+
+        purge_orphan_lod_data(base_name)
 
         self.report({'INFO'}, f"LODs supprimés pour '{base_name}'.")
         return {'FINISHED'}

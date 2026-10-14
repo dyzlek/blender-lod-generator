@@ -25,6 +25,9 @@ class LODStatItem(bpy.types.PropertyGroup):
     screen_threshold: FloatProperty(name="Seuil d'écran", default=0.5)
     culled_islands: IntProperty(name="Îlots culled", default=0)
     repaired_uv_faces: IntProperty(name="Faces UV réparées", default=0)
+    deviation: FloatProperty(name="Écart max", default=0.0, subtype='DISTANCE', unit='LENGTH')
+    error_budget: FloatProperty(name="Budget d'erreur", default=0.0, subtype='DISTANCE', unit='LENGTH')
+    is_impostor: BoolProperty(name="Imposteur", default=False)
 
 
 class LODGeneratorSettings(bpy.types.PropertyGroup):
@@ -265,6 +268,159 @@ class LODGeneratorSettings(bpy.types.PropertyGroup):
             ('GLTF', "glTF (.glb)", "Standard Godot & WebXR")
         ],
         default='FBX'
+    )
+
+    # --- Mode de réduction : pourcentage, budget d'erreur ou taille écran ---
+    reduction_mode: EnumProperty(
+        name="Mode de réduction",
+        description="Comment la quantité de triangles de chaque LOD est déterminée",
+        items=[
+            ('RATIO', "Pourcentage", "Ratio de triangles par niveau (preset ci-dessus)"),
+            ('ERROR', "Budget d'erreur", "Réduit tant que l'écart géométrique avec LOD0 reste sous un seuil"),
+            ('SCREEN', "Taille écran", "Écart toléré déduit du seuil d'écran de chaque LOD et d'une erreur en pixels"),
+        ],
+        default='RATIO'
+    )
+
+    max_error: FloatProperty(
+        name="Erreur max (LOD1)",
+        description="Écart géométrique maximal toléré pour le LOD1 (distance de Hausdorff avec LOD0)",
+        default=0.002,
+        min=0.00001,
+        soft_max=0.1,
+        precision=4,
+        subtype='DISTANCE',
+        unit='LENGTH'
+    )
+
+    error_growth: FloatProperty(
+        name="Croissance par niveau",
+        description="Multiplicateur de l'erreur tolérée à chaque niveau (x2 : 2 mm, 4 mm, 8 mm...)",
+        default=2.0,
+        min=1.0,
+        max=8.0
+    )
+
+    pixel_error: FloatProperty(
+        name="Erreur écran (px)",
+        description="Écart maximal toléré, en pixels, au seuil d'écran de chaque LOD",
+        default=1.0,
+        min=0.1,
+        max=20.0
+    )
+
+    screen_height_px: IntProperty(
+        name="Hauteur écran (px)",
+        description="Résolution verticale de référence pour le mode Taille écran",
+        default=1080,
+        min=240,
+        max=8640
+    )
+
+    # --- Remesh avant décimation ---
+    remesh_mode: EnumProperty(
+        name="Remesh",
+        description="Remaillage avant décimation pour les modèles sales (scans, sculpts, kitbash)",
+        items=[
+            ('NONE', "Aucun", "Décime directement la topologie d'origine"),
+            ('VOXEL', "Voxel", "Fusionne les îlots et referme la surface"),
+            ('QUADRIFLOW', "QuadriFlow", "Remaillage en quads propres (repli sur Voxel en cas d'échec)"),
+        ],
+        default='NONE'
+    )
+
+    remesh_voxel_pct: FloatProperty(
+        name="Taille voxel (%)",
+        description="Taille de voxel en pourcentage du rayon englobant",
+        default=1.0,
+        min=0.1,
+        max=10.0
+    )
+
+    remesh_quadriflow_ratio: FloatProperty(
+        name="Faces QuadriFlow",
+        description="Nombre de faces cible relatif à la source",
+        default=0.5,
+        min=0.01,
+        max=1.0,
+        subtype='FACTOR'
+    )
+
+    remesh_from_level: IntProperty(
+        name="À partir du LOD",
+        description="Premier niveau remaillé (LOD0 n'est jamais modifié)",
+        default=1,
+        min=1,
+        max=6
+    )
+
+    # --- Bake des normales et de l'AO ---
+    bake_enabled: BoolProperty(
+        name="Bake normales & AO",
+        description="Bake les détails de LOD0 (normal map, occlusion) sur les LODs lointains",
+        default=False
+    )
+
+    bake_from_level: IntProperty(
+        name="À partir du LOD",
+        description="Premier niveau baké",
+        default=3,
+        min=1,
+        max=6
+    )
+
+    bake_resolution: EnumProperty(
+        name="Résolution",
+        items=[(str(r), f"{r} px", "") for r in (256, 512, 1024, 2048, 4096)],
+        default='1024'
+    )
+
+    bake_ao: BoolProperty(
+        name="Ambient Occlusion",
+        description="Bake aussi l'occlusion ambiante de LOD0 (multipliée à la couleur de base)",
+        default=True
+    )
+
+    bake_ao_samples: IntProperty(
+        name="Échantillons AO",
+        default=16,
+        min=1,
+        max=1024
+    )
+
+    bake_dedicated_uv: BoolProperty(
+        name="UVs dédiées au bake",
+        description="Crée un calque UV sans chevauchement (Smart UV Project) pour les maps bakées",
+        default=False
+    )
+
+    # --- Imposteur billboard ---
+    impostor_enabled: BoolProperty(
+        name="Imposteur (dernier LOD)",
+        description="Ajoute un dernier niveau : billboard texturé capturé sous plusieurs angles",
+        default=False
+    )
+
+    impostor_views: EnumProperty(
+        name="Vues",
+        items=[('8', "8 angles", ""), ('16', "16 angles", "")],
+        default='8'
+    )
+
+    impostor_resolution: IntProperty(
+        name="Résolution par vue",
+        default=256,
+        min=32,
+        max=2048
+    )
+
+    impostor_engine: EnumProperty(
+        name="Moteur de capture",
+        items=[
+            ('WORKBENCH', "Workbench", "Rapide, couleurs et textures sans éclairage réaliste"),
+            ('EEVEE', "EEVEE", "Fidèle aux matériaux"),
+        ],
+        default='EEVEE'
     )
 
     # --- Données de session ---

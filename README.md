@@ -93,6 +93,14 @@ Copiez le dossier `lod_generator_addon` dans le répertoire d'add-ons correspond
 5. Contrôlez les niveaux à l'aide des fonctions **Vue éclatée** ou **Distance caméra**.
 6. Exportez le résultat au format FBX ou glTF.
 
+### Qualité de décimation
+
+- **Mode de réduction** (section 2) : *Pourcentage* (preset classique), *Budget d'erreur* (« réduis tant que l'écart reste sous 2 mm », tolérance multipliée à chaque niveau) ou *Taille écran* (écart toléré déduit du seuil d'écran de chaque LOD et d'une erreur en pixels). L'écart réellement mesuré (Hausdorff avec LOD0) est affiché dans le tableau de statistiques.
+- **Remesh avant décimation** (section 5) : *Voxel* (fusionne les îlots, referme les trous) ou *QuadriFlow* (quads propres, repli sur Voxel si besoin) pour les scans, sculpts et kitbash. UVs et matériaux sont restaurés depuis la source.
+- **Bake normales & AO** (section 6) : les détails de LOD0 sont bakés (Cycles) sur les LODs lointains, dans des copies de leurs matériaux. Si les UVs se chevauchent ou sont tuilées, un calque `LOD_BakeUV` est créé automatiquement.
+- **Imposteur** (section 6) : dernier niveau en billboard « étoile » (8 ou 16 vues capturées dans un atlas), idéal pour la végétation et les décors lointains.
+
+
 ---
 
 ## Intégration Moteurs
@@ -132,6 +140,10 @@ Le projet comprend une suite de validation exécutable en mode arrière-plan (*h
 --- Test 6: Exportation Moteur (FBX et glTF) ---                         [OK]
 --- Test 7: Algorithmes Avances de Preservation des UVs ---              [OK]
 --- Test 8: Nettoyage et Reinitialisation ---                            [OK]
+--- Test 8b: Coque a double paroi (ballon, solidify) ---                  [OK]
+--- Test 12: Budget d'erreur et taille ecran ---                           [OK]
+--- Test 13: Remesh Voxel / QuadriFlow avant decimation ---               [OK]
+--- Test 14: Bake normales & AO + imposteur billboard ---                 [OK]
 ======================================================================
   TOUS LES TESTS SONT PASSES AVEC SUCCES.
 ======================================================================
