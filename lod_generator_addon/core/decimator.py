@@ -73,11 +73,39 @@ def cull_small_islands_from_object(obj: bpy.types.Object, threshold_pct: float) 
     return culled_count
 
 
+def find_nearest_same_side(bvh: BVHTree, co: Vector, ref_normal: Vector, max_radius: float):
+    """
+    BVH nearest-point query restricted to faces oriented like ref_normal.
+    On thin double-walled meshes (balloons, bottles, solidified shells) the plain
+    nearest face is often the opposite wall, whose normal points the other way:
+    sampling it projects vertices onto the wrong wall and inverts shading.
+    Returns (location, normal, index, distance), or Nones when nothing matches.
+    """
+    hit = bvh.find_nearest(co)
+    if hit[0] is None or ref_normal.length == 0.0 or hit[1].dot(ref_normal) > 0.0:
+        return hit
+
+    radius = max(hit[3] * 2.0, 1e-4)
+    while radius <= max_radius:
+        candidates = [h for h in bvh.find_nearest_range(co, radius) if h[1].dot(ref_normal) > 0.0]
+        if candidates:
+            return min(candidates, key=lambda h: h[3])
+        radius *= 2.0
+    return None, None, None, None
+
+
+def _search_radius(obj: bpy.types.Object) -> float:
+    """Maximum search distance for same-side queries (a quarter of the bounding radius)."""
+    _, radius = calculate_coords_bounding_sphere([v.co for v in obj.data.vertices])
+    return max(radius * 0.25, 1e-4)
+
+
 def unfold_and_harmonize_shading(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
     """
-    Unfolds any geometrically inverted triangles (foldovers) by relaxing their vertices
-    without breaking manifold winding order (never flips a single face inside a closed mesh),
-    recalculates consistent manifold normals, and harmonizes Smooth Shading with LOD0.
+    Unfolds geometrically inverted triangles (foldovers) by relaxing their vertices
+    and re-projecting them onto the same-side LOD0 surface, then harmonizes Smooth
+    Shading with LOD0. Winding is never recalculated: decimation preserves it, and a
+    global recalculation flips intentionally inward-facing shells (inner walls).
     """
     if not target_obj or not lod0_obj:
         return 0
@@ -88,6 +116,7 @@ def unfold_and_harmonize_shading(target_obj: bpy.types.Object, lod0_obj: bpy.typ
     bm0.from_mesh(lod0_obj.data)
     bm0.faces.ensure_lookup_table()
     bvh0 = BVHTree.FromBMesh(bm0)
+    max_radius = _search_radius(lod0_obj)
 
     bm = bmesh.new()
     bm.from_mesh(target_obj.data)
@@ -100,36 +129,36 @@ def unfold_and_harmonize_shading(target_obj: bpy.types.Object, lod0_obj: bpy.typ
         bmesh.ops.delete(bm, geom=degenerate_faces, context='FACES')
         bm.faces.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
+    bm.normal_update()
 
-    # 2. Detect geometrically folded faces (where face normal opposes LOD0 normal)
-    # Instead of flipping winding of a single triangle (which creates non-manifold bright gray faces),
-    # we relax its vertices toward their connected neighbors and re-project onto LOD0 surface.
-    folded_verts = set()
+    # 2. Detect folded faces topologically: a foldover points against its edge neighbours.
+    # (Comparing with the nearest LOD0 face is unreliable on double-walled meshes,
+    # where the nearest face may belong to the opposite wall.)
+    folded_faces = set()
     for f in bm.faces:
         f.smooth = lod0_is_smooth
-        center = f.calc_center_median()
-        _, norm0, _, _ = bvh0.find_nearest(center)
-        if norm0 is not None and f.normal.length > 0.0:
-            if f.normal.dot(norm0) < -0.1:
-                for v in f.verts:
-                    folded_verts.add(v)
+        dots = [f.normal.dot(other.normal) for e in f.edges for other in e.link_faces if other is not f]
+        if dots and sum(dots) / len(dots) < -0.2:
+            folded_faces.add(f)
+
+    folded_verts = {v for f in folded_faces for v in f.verts}
 
     if folded_verts:
         for _ in range(2):
             new_positions = {}
             for v in folded_verts:
                 neighbors = [e.other_vert(v).co for e in v.link_edges]
-                if neighbors:
-                    avg_co = sum(neighbors, Vector((0.0, 0.0, 0.0))) / len(neighbors)
-                    relaxed = v.co.lerp(avg_co, 0.5)
-                    loc, _, _, _ = bvh0.find_nearest(relaxed)
-                    new_positions[v] = loc if loc is not None else relaxed
+                if not neighbors:
+                    continue
+                avg_co = sum(neighbors, Vector((0.0, 0.0, 0.0))) / len(neighbors)
+                relaxed = v.co.lerp(avg_co, 0.5)
+                ref_normal = sum((f.normal for f in v.link_faces if f not in folded_faces),
+                                 Vector((0.0, 0.0, 0.0)))
+                loc, _, _, _ = find_nearest_same_side(bvh0, relaxed, ref_normal, max_radius)
+                new_positions[v] = loc if loc is not None else relaxed
             for v, pos in new_positions.items():
                 v.co = pos
-
-    # 3. Ensure globally consistent manifold winding across the entire mesh
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    bm.normal_update()
+            bm.normal_update()
 
     bm.to_mesh(target_obj.data)
     target_obj.data.update()
@@ -137,6 +166,70 @@ def unfold_and_harmonize_shading(target_obj: bpy.types.Object, lod0_obj: bpy.typ
     bm0.free()
     bm.free()
     return len(folded_verts)
+
+
+def transfer_lod0_normals(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
+    """
+    Transfers LOD0 corner normals onto the LOD as custom split normals, sampling only
+    LOD0 faces oriented like each target face (barycentric interpolation on the hit
+    triangle). Replaces the Data Transfer modifier, whose nearest-face mapping picks
+    the opposite wall on thin double-walled meshes and paints dark inverted patches.
+    Returns the number of corners that fell back to their own face normal.
+    """
+    if not target_obj or not lod0_obj:
+        return 0
+
+    me0 = lod0_obj.data
+    corner_normals0 = [cn.vector.copy() for cn in me0.corner_normals]
+
+    bm0 = bmesh.new()
+    bm0.from_mesh(me0)
+    bm0.faces.ensure_lookup_table()
+    nor_layer = bm0.loops.layers.float_vector.new("_lod_corner_normal")
+    for f, poly in zip(bm0.faces, me0.polygons):
+        for loop, loop_index in zip(f.loops, poly.loop_indices):
+            loop[nor_layer] = corner_normals0[loop_index]
+    bmesh.ops.triangulate(bm0, faces=bm0.faces)
+    bm0.faces.ensure_lookup_table()
+    bm0.normal_update()
+    bvh0 = BVHTree.FromBMesh(bm0)
+    max_radius = _search_radius(lod0_obj)
+
+    me = target_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+
+    normals = [Vector((0.0, 0.0, 1.0))] * len(me.loops)
+    fallbacks = 0
+    for f, poly in zip(bm.faces, me.polygons):
+        center = f.calc_center_median()
+        for loop, loop_index in zip(f.loops, poly.loop_indices):
+            co = loop.vert.co
+            # Sample slightly inside the face so hard edges pick the face on the right side
+            _, _, idx, _ = find_nearest_same_side(bvh0, co.lerp(center, 0.1), f.normal, max_radius)
+            if idx is None:
+                normals[loop_index] = f.normal.copy()
+                fallbacks += 1
+                continue
+            tri = bm0.faces[idx]
+            n = barycentric_transform(
+                co,
+                tri.verts[0].co, tri.verts[1].co, tri.verts[2].co,
+                tri.loops[0][nor_layer], tri.loops[1][nor_layer], tri.loops[2][nor_layer],
+            )
+            if n.length < 1e-6 or n.dot(f.normal) <= 0.0:
+                n = f.normal.copy()
+                fallbacks += 1
+            normals[loop_index] = n.normalized()
+
+    bm0.free()
+    bm.free()
+
+    me.normals_split_custom_set(normals)
+    me.update()
+    return fallbacks
 
 
 def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
@@ -160,10 +253,13 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
 
     bvh0 = BVHTree.FromBMesh(bm0)
 
+    max_radius = _search_radius(lod0_obj)
+
     bm_target = bmesh.new()
     bm_target.from_mesh(target_obj.data)
     bm_target.faces.ensure_lookup_table()
     bm_target.verts.ensure_lookup_table()
+    bm_target.normal_update()
 
     uv_layer_target = bm_target.loops.layers.uv.active
     if not uv_layer_target:
@@ -193,7 +289,7 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
             for loop in f.loops:
                 # Sample slightly inward toward face center and use the EXACT hit face (hit_face_idx)
                 sample_pt = loop.vert.co.lerp(face_center, 0.15)
-                loc, _, hit_face_idx, _ = bvh0.find_nearest(sample_pt)
+                loc, _, hit_face_idx, _ = find_nearest_same_side(bvh0, sample_pt, f.normal, max_radius)
                 if loc is not None and hit_face_idx is not None and hit_face_idx < len(bm0.faces):
                     f_hit = bm0.faces[hit_face_idx]
                     pA, pB, pC = f_hit.verts[0].co, f_hit.verts[1].co, f_hit.verts[2].co
@@ -243,7 +339,8 @@ def apply_modifier_safely(context, obj: bpy.types.Object, mod_name: str) -> bool
 
     success = True
     try:
-        bpy.ops.object.modifier_apply(modifier=mod_name)
+        with context.temp_override(object=obj, active_object=obj):
+            bpy.ops.object.modifier_apply(modifier=mod_name)
     except Exception as err:
         print(f"[LOD Generator] Failed to apply modifier '{mod_name}' on '{obj.name}': {err}")
         success = False
@@ -398,13 +495,7 @@ def generate_lod_mesh(
 
     # 12. Pass 4 — Shading Restoration (Custom Normal Transfer)
     if normal_strategy == 'TRANSFER' and lod0_obj:
-        mod_norm = new_obj.modifiers.new(name="LOD_Normal_Transfer", type='DATA_TRANSFER')
-        mod_norm.object = lod0_obj
-        mod_norm.use_object_transform = False
-        mod_norm.use_loop_data = True
-        mod_norm.data_types_loops = {'CUSTOM_NORMAL'}
-        mod_norm.loop_mapping = 'POLYINTERP_NEAREST'
-        apply_modifier_safely(context, new_obj, mod_norm.name)
+        transfer_lod0_normals(new_obj, lod0_obj)
 
     elif normal_strategy == 'WEIGHTED':
         mod_wn = new_obj.modifiers.new(name="LOD_Weighted_Normal", type='WEIGHTED_NORMAL')

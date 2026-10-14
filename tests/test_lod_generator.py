@@ -418,6 +418,41 @@ def test_uv_preservation_suite():
     print("[OK] Validation mathematique du module de preservation des UVs.")
 
 
+def test_double_walled_shell():
+    print("\n--- Test 8b: Coque a double paroi (ballon, solidify) ---")
+    from lod_generator_addon.core.decimator import generate_lod_mesh
+    from lod_generator_addon.utils.math_helpers import get_triangulated_face_count
+
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12, radius=0.3, location=(0, 0, 0))
+    shell = bpy.context.active_object
+    shell.name = "TestShell_LOD0"
+    bpy.ops.object.shade_smooth()
+    mod = shell.modifiers.new("Solidify", 'SOLIDIFY')
+    mod.thickness = 0.014
+    mod.use_rim = False
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    tris = get_triangulated_face_count(shell)
+    for level, ratio in [(1, 0.5), (2, 0.25)]:
+        lod, _ = generate_lod_mesh(bpy.context, shell, shell, f"TestShell_LOD{level}", ratio, level, tris)
+        me = lod.data
+        inverted = sum(
+            1 for p in me.polygons for li in p.loop_indices
+            if me.corner_normals[li].vector.dot(p.normal) < 0.0
+        )
+        assert inverted == 0, f"LOD{level}: {inverted} normales inversees (paroi opposee echantillonnee) !"
+        inward = sum(1 for p in me.polygons if p.normal.dot(p.center) < 0.0)
+        assert inward > 0, f"LOD{level}: la paroi interieure a ete retournee vers l'exterieur !"
+        mesh = lod.data
+        bpy.data.objects.remove(lod, do_unlink=True)
+        bpy.data.meshes.remove(mesh)
+
+    mesh = shell.data
+    bpy.data.objects.remove(shell, do_unlink=True)
+    bpy.data.meshes.remove(mesh)
+    print("✓ Parois interieures preservees, aucune normale inversee.")
+
+
 def test_cleanup():
     print("\n--- Test 8: Nettoyage et Réinitialisation ---")
     base_name = "TestHeroAsset"
@@ -450,6 +485,7 @@ def main():
         test_exploded_view()
         test_engine_export()
         test_uv_preservation_suite()
+        test_double_walled_shell()
         test_cleanup()
 
         print("\n" + "=" * 70)

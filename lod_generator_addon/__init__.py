@@ -7,7 +7,7 @@ BFS island culling, QEM edge collapse, custom normal projection, and LodGroup Em
 bl_info = {
     "name": "Procedural LOD Generator Pro",
     "author": "Dylan",
-    "version": (1, 1, 2),
+    "version": (1, 1, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (N) > LOD Generator",
     "description": "Générateur procédural avancé de LODs pour moteurs de jeux (Unreal, Unity, Godot) avec protection UV/silhouette et hiérarchie LodGroup.",
