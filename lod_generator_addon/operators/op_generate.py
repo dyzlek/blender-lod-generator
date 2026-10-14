@@ -7,10 +7,14 @@ and stats collection.
 import time
 import bpy
 from ..core.analyzer import audit_mesh
-from ..core.decimator import iter_generate_lod_mesh, run_steps
+from ..core.decimator import iter_generate_lod_mesh, iter_find_ratio_for_error, run_steps, _scaled
+from ..core.error_metrics import measure_deviation, level_error_budget
+from ..core.baker import bake_lod_maps
+from ..core.impostor import generate_impostor
+from ..utils.settings_map import pipeline_kwargs
 from ..core.weight_mapper import apply_protection_mask_to_object, PROTECTION_VG_NAME
 from ..core.collider_gen import generate_convex_hull_collider, generate_box_collider
-from ..utils.hierarchy import get_base_name, setup_lod_group_empty, get_or_create_collection
+from ..utils.hierarchy import get_base_name, setup_lod_group_empty, get_or_create_collection, purge_orphan_lod_data
 from ..utils.math_helpers import (
     calculate_ratios,
     get_triangulated_face_count,
@@ -105,9 +109,18 @@ class LOD_OT_generate(bpy.types.Operator):
         lod_count = settings.lod_count
         prev_obj = lod0_obj
 
+        baked_levels = [k for k in range(1, lod_count + 1)
+                        if settings.bake_enabled and k >= settings.bake_from_level]
+        # Progress units: one per LOD, one per baked LOD, one for the impostor
+        total = lod_count + len(baked_levels) + (1 if settings.impostor_enabled else 0)
+        unit = 0
+        kwargs = pipeline_kwargs(settings)
+        prev_ratio = 1.0
+
         # Generation loop
         for k in range(1, lod_count + 1):
             lod_name = f"{self.base_name}_LOD{k}"
+            prefix = f"LOD{k}/{lod_count}"
 
             # A previous LOD with this name is only replaced once the new one is complete,
             # so cancelling leaves the levels not yet regenerated untouched
@@ -116,7 +129,22 @@ class LOD_OT_generate(bpy.types.Operator):
                 old_obj = None
 
             source_for_pass = lod0_obj if settings.generation_mode == 'PARALLEL' else prev_obj
-            target_ratio = self.ratios[k - 1]
+
+            # Error budget / screen size: search the smallest ratio within the budget
+            budget = 0.0
+            start = 0.0
+            if settings.reduction_mode == 'RATIO':
+                target_ratio = self.ratios[k - 1]
+            else:
+                budget = level_error_budget(settings, k, lod0_obj, self.screen_thresholds)
+                search = iter_find_ratio_for_error(
+                    context, source_for_pass, lod0_obj, budget, k, self.original_triangles,
+                    max_ratio=prev_ratio, **kwargs
+                )
+                target_ratio, _ = yield from self._timed(
+                    _scaled(search, "Recherche du ratio (budget d'erreur)", 0.0, 0.5), prefix, unit, total)
+                start = 0.5
+            prev_ratio = target_ratio
 
             lod_steps = iter_generate_lod_mesh(
                 context=context,
@@ -126,32 +154,13 @@ class LOD_OT_generate(bpy.types.Operator):
                 target_ratio=target_ratio,
                 lod_level=k,
                 original_lod0_triangles=self.original_triangles,
-                pre_triangulate=settings.pre_triangulate,
-                use_delimit_uv=settings.use_delimit_uv,
-                uv_border_curvature=settings.uv_border_curvature,
-                bvh_repair_uv=settings.bvh_repair_uv,
-                split_weld_isolation=settings.split_weld_isolation,
-                preserve_uv=settings.preserve_uv_seams,
-                preserve_silhouette=settings.preserve_silhouette,
-                silhouette_angle_rad=settings.silhouette_angle,
-                preserve_boundary=settings.preserve_open_boundaries,
-                preserve_material=settings.preserve_material_borders,
-                preserve_skinning=settings.preserve_skinning,
-                relax_weights=settings.relax_weights_per_lod,
-                pre_planar_dissolve=settings.pre_planar_dissolve,
-                planar_angle_limit_rad=settings.planar_angle_limit,
-                cull_small_parts=settings.cull_small_parts,
-                cull_threshold_pct=settings.cull_threshold,
-                normal_strategy=settings.normal_strategy,
-                keep_protection_mask=settings.keep_protection_mask
+                **kwargs
             )
-            new_lod_obj, stats = yield from self._timed(lod_steps, k, lod_count)
+            new_lod_obj, stats = yield from self._timed(_remap(lod_steps, start, 1.0), prefix, unit, total)
+            unit += 1
 
             if old_obj is not None:
-                old_mesh = old_obj.data if old_obj.type == 'MESH' else None
-                bpy.data.objects.remove(old_obj, do_unlink=True)
-                if old_mesh and old_mesh.users == 0:
-                    bpy.data.meshes.remove(old_mesh)
+                _remove_object(old_obj)
                 new_lod_obj.name = lod_name
                 new_lod_obj.data.name = f"{lod_name}_Mesh"
 
@@ -167,28 +176,78 @@ class LOD_OT_generate(bpy.types.Operator):
             stat_entry.screen_threshold = self.screen_thresholds[k] if k < len(self.screen_thresholds) else 0.05
             stat_entry.culled_islands = stats["culled_islands"]
             stat_entry.repaired_uv_faces = stats.get("repaired_uvs", 0)
+            stat_entry.deviation = measure_deviation(new_lod_obj, lod0_obj)
+            stat_entry.error_budget = budget
+
+        # Normal & AO bake on distant LODs
+        for k in baked_levels:
+            yield f"LOD{k} : bake normales & AO", unit / total
+            started = time.perf_counter()
+            bake_lod_maps(
+                context, self.created_lods[k], lod0_obj,
+                resolution=int(settings.bake_resolution),
+                bake_ao=settings.bake_ao,
+                dedicated_uv=settings.bake_dedicated_uv,
+                ao_samples=settings.bake_ao_samples,
+            )
+            self._add_time("Bake normales & AO", started)
+            unit += 1
+
+        # Billboard impostor as the last level
+        if settings.impostor_enabled:
+            level = lod_count + 1
+            name = f"{self.base_name}_LOD{level}"
+            yield f"LOD{level} : imposteur ({settings.impostor_views} vues)", unit / total
+            started = time.perf_counter()
+            old_obj = bpy.data.objects.get(name)
+            impostor = generate_impostor(
+                context, lod0_obj, name,
+                views=int(settings.impostor_views),
+                resolution=settings.impostor_resolution,
+                engine=settings.impostor_engine,
+            )
+            if old_obj is not None and old_obj != lod0_obj:
+                _remove_object(old_obj)
+                impostor.name = name
+                impostor.data.name = f"{name}_Mesh"
+            self._add_time("Imposteur", started)
+
+            triangles = get_triangulated_face_count(impostor)
+            reduction = round((1.0 - triangles / max(1, self.original_triangles)) * 100.0, 1)
+            self.created_lods.append(impostor)
+            self.last_stats = {"triangles": triangles, "reduction_pct": reduction}
+            stat_entry = settings.stats_items.add()
+            stat_entry.lod_name = name
+            stat_entry.lod_level = level
+            stat_entry.triangles = triangles
+            stat_entry.reduction_pct = reduction
+            stat_entry.screen_threshold = self.screen_thresholds[-1] * 0.5
+            stat_entry.is_impostor = True
+            unit += 1
 
         yield "Collider & hiérarchie LodGroup", 1.0
         self._package(context)
 
-    def _timed(self, lod_steps, level: int, lod_count: int):
+    def _add_time(self, label: str, started: float):
+        self.step_times[label] = self.step_times.get(label, 0.0) + time.perf_counter() - started
+
+    def _timed(self, steps, prefix: str, unit: int, total: int):
         """Maps one LOD's (label, fraction) onto the whole run and accumulates time per step."""
         label, mark = None, time.perf_counter()
         while True:
             try:
-                next_label, fraction = next(lod_steps)
+                next_label, fraction = next(steps)
             except StopIteration as stop:
                 if label:
-                    self.step_times[label] = self.step_times.get(label, 0.0) + time.perf_counter() - mark
+                    self._add_time(label, mark)
                 return stop.value
-            now = time.perf_counter()
             if label:
-                self.step_times[label] = self.step_times.get(label, 0.0) + now - mark
-            label, mark = next_label, now
+                self._add_time(label, mark)
+            label, mark = next_label, time.perf_counter()
             try:
-                yield f"LOD{level}/{lod_count} : {next_label}", (level - 1 + fraction) / lod_count
+                yield f"{prefix} : {next_label}", (unit + fraction) / total
             except GeneratorExit:
-                lod_steps.close()
+                steps.close()
                 raise
 
     def _package(self, context):
@@ -215,6 +274,9 @@ class LOD_OT_generate(bpy.types.Operator):
         return f"{total:.1f} s, étape la plus longue : {slowest} ({seconds:.1f} s)"
 
     def _finish(self, context):
+        # Materials and maps of replaced LODs are no longer used
+        purge_orphan_lod_data(self.base_name)
+
         # Set active back to LOD0
         context.view_layer.objects.active = self.lod0_obj
         self.lod0_obj.select_set(True)
@@ -314,6 +376,7 @@ class LOD_OT_generate(bpy.types.Operator):
             if mesh.users == 0:
                 bpy.data.meshes.remove(mesh)
         self.created_lods = self.created_lods[:1]
+        purge_orphan_lod_data(self.base_name)
         while len(settings.stats_items) > 1:
             settings.stats_items.remove(len(settings.stats_items) - 1)
 
@@ -344,6 +407,28 @@ class LOD_OT_cancel_generation(bpy.types.Operator):
     def execute(self, context):
         context.scene.lod_generator_settings.cancel_requested = True
         return {'FINISHED'}
+
+
+def _remap(steps, start: float, end: float):
+    """Re-yields (label, fraction) pairs with the fraction mapped into [start, end]."""
+    while True:
+        try:
+            label, fraction = next(steps)
+        except StopIteration as stop:
+            return stop.value
+        try:
+            yield label, start + (end - start) * fraction
+        except GeneratorExit:
+            steps.close()
+            raise
+
+
+def _remove_object(obj):
+    """Removes an object and its mesh when no longer used."""
+    mesh = obj.data if obj.type == 'MESH' else None
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
 
 
 def _redraw_ui(context):
@@ -434,6 +519,8 @@ class LOD_OT_clear_lods(bpy.types.Operator):
 
         settings.stats_items.clear()
         settings.is_exploded = False
+
+        purge_orphan_lod_data(base_name)
 
         self.report({'INFO'}, f"LODs supprimés pour '{base_name}'.")
         return {'FINISHED'}

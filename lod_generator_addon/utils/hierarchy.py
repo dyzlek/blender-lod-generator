@@ -129,3 +129,29 @@ def reset_exploded_view(lod_objects: list[bpy.types.Object]):
     """
     for obj in lod_objects:
         obj.location = Vector((0.0, 0.0, 0.0))
+
+
+def purge_orphan_lod_data(base_name: str) -> int:
+    """
+    Removes unused materials and images created for the LODs of base_name (baked maps,
+    impostor atlas: their names start with '<base>_LOD'). Returns the number removed.
+    """
+    prefix, source_prefix = f"{base_name}_LOD", f"{base_name}_LOD0"
+    removed = 0
+    for collection in (bpy.data.materials, bpy.data.images):
+        for block in [b for b in collection
+                      if b.name.startswith(prefix) and not b.name.startswith(source_prefix) and b.users == 0]:
+            collection.remove(block)
+            removed += 1
+    return removed
+
+
+def free_datablock_name(collection, name: str) -> str:
+    """
+    Renames an existing datablock called `name` (e.g. the maps of the LOD being replaced)
+    so a new one can take the exact name; the old one is purged once unused.
+    """
+    existing = collection.get(name)
+    if existing is not None:
+        existing.name = f"{name}_prev"
+    return name
