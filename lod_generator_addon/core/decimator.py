@@ -84,6 +84,54 @@ def cull_small_islands_from_object(obj: bpy.types.Object, threshold_pct: float) 
     return culled_count
 
 
+def fix_flipped_faces_and_smoothing(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
+    """
+    Corrige les triangles qui se sont replies/inverses (normale a 180 deg) pendant la decimation
+    et harmonise l'etat Smooth Shading (f.smooth) avec le LOD0 pour eviter les triangles plats gris clairs.
+    """
+    if not target_obj or not lod0_obj:
+        return 0
+
+    # Verifier si le LOD0 utilise le Smooth Shading
+    lod0_is_smooth = any(p.use_smooth for p in lod0_obj.data.polygons)
+
+    bm0 = bmesh.new()
+    bm0.from_mesh(lod0_obj.data)
+    bm0.faces.ensure_lookup_table()
+    bvh0 = BVHTree.FromBMesh(bm0)
+
+    bm = bmesh.new()
+    bm.from_mesh(target_obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+
+    # 1. Supprimer les faces degenerees d'aire nulle (aretes ecrasees)
+    degenerate_faces = [f for f in bm.faces if f.calc_area() <= 1e-8]
+    if degenerate_faces:
+        bmesh.ops.delete(bm, geom=degenerate_faces, context='FACES')
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+
+    # 2. Reorienter les triangles inverses par rapport a la normale du LOD0
+    flipped_count = 0
+    for f in bm.faces:
+        f.smooth = lod0_is_smooth
+        center = f.calc_center_median()
+        _, norm0, _, _ = bvh0.find_nearest(center)
+        if norm0 is not None and f.normal.length > 0.0:
+            if f.normal.dot(norm0) < -0.15:
+                f.normal_flip()
+                flipped_count += 1
+
+    bm.normal_update()
+    bm.to_mesh(target_obj.data)
+    target_obj.data.update()
+
+    bm0.free()
+    bm.free()
+    return flipped_count
+
+
 def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
     """
     Scans the decimated mesh for UV foldovers or degenerated UV faces (e.g. barcode artifacts
@@ -251,7 +299,7 @@ def generate_lod_mesh(
         mod_tri = new_obj.modifiers.new(name="LOD_Pre_Triangulate", type='TRIANGULATE')
         mod_tri.quad_method = 'BEAUTY'
         mod_tri.ngon_method = 'CLIP'
-        mod_tri.keep_custom_normals = True
+        mod_tri.keep_custom_normals = False
         apply_modifier_safely(context, new_obj, mod_tri.name)
 
     # 3. Geometry Culling for small detached components on distant LODs
@@ -320,7 +368,7 @@ def generate_lod_mesh(
         mod_qem.use_collapse_triangulate = True
         mod_qem.vertex_group = PROTECTION_VG_NAME
         mod_qem.invert_vertex_group = True
-        mod_qem.vertex_group_factor = 1.0
+        mod_qem.vertex_group_factor = 0.70
 
         # Native C++ boundary barrier: keep 'UV' on ALL LOD levels to prevent bridges between UV islands
         if use_delimit_uv:
@@ -337,6 +385,10 @@ def generate_lod_mesh(
         bm_weld.to_mesh(new_obj.data)
         new_obj.data.update()
         bm_weld.free()
+
+    # 8.5 Repair flipped faces (foldovers) and harmonize smooth shading before normal transfer
+    if lod0_obj:
+        fix_flipped_faces_and_smoothing(new_obj, lod0_obj)
 
     # 9. Pass 3 — Post-Decimation UV Repair via BVH Tree (Rule D)
     repaired_uvs = 0

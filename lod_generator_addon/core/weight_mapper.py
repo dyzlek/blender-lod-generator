@@ -40,7 +40,7 @@ def mark_uv_discontinuities_as_seams(bm: bmesh.types.BMesh, epsilon: float = 1e-
                     uv1_B = lp[uv_layer].uv
 
             if uv0_A and uv1_A and uv0_B and uv1_B:
-                if (uv0_A - uv1_A).length > epsilon or (uv0_B - uv1_B).length > epsilon:
+                if (uv0_A - uv1_A).length > epsilon and (uv0_B - uv1_B).length > epsilon:
                     e.seam = True
                     marked_count += 1
     return marked_count
@@ -88,9 +88,7 @@ def compute_vertex_protection_weights(
     eff_sil_angle = silhouette_angle_rad
 
     if lod_level >= 3 and relax_weights:
-        # Do not drop to 0.0, otherwise UV islands merge and tear textures (black diamonds).
-        # Maintain a floor of 0.5 to allow sliding along seams without collapsing across them.
-        eff_preserve_uv = max(0.5, preserve_uv * 0.6)
+        eff_preserve_uv = max(0.35, preserve_uv * 0.5)
         eff_preserve_mat = max(0.5, preserve_material * 0.6)
         eff_sil_angle = max(silhouette_angle_rad, math.radians(50.0))
 
@@ -102,109 +100,94 @@ def compute_vertex_protection_weights(
         w_curve = 0.0
         w_skin = 0.0
 
+        # --- 0. Detection de Pole Geometrique (ex: pole Nord/Sud d'une sphere) ---
+        # Un sommet ou convergent >= 8 aretes sur une surface lisse ne doit JAMAIS
+        # etre verrouille, sinon il cree un pic pointu lors de la reduction autour de lui.
+        is_smooth_pole = False
+        if len(v.link_edges) >= 8:
+            has_sharp_or_boundary = any((len(e.link_faces) < 2 or not e.smooth) for e in v.link_edges)
+            if not has_sharp_or_boundary:
+                is_smooth_pole = True
+
         # --- 1. Open Boundary Check ---
         for e in v.link_edges:
             if len(e.link_faces) == 1:
                 w_boundary = max(w_boundary, preserve_boundary)
                 break
 
-        # --- 2. UV Seam Check & 2D UV Border Curvature Analysis ---
-        if eff_preserve_uv > 0.0:
-            is_uv_seam = False
-            for e in v.link_edges:
-                if e.seam:
-                    is_uv_seam = True
-                    break
+        # --- 2. Courbure 3D & Silhouette ---
+        max_dihedral = 0.0
+        is_sharp_edge = False
+        for e in v.link_edges:
+            if not e.smooth:
+                is_sharp_edge = True
+            if len(e.link_faces) == 2:
+                n1 = e.link_faces[0].normal
+                n2 = e.link_faces[1].normal
+                dot_val = clamp(n1.dot(n2), -1.0, 1.0)
+                dihedral = math.acos(dot_val)
+                if dihedral > max_dihedral:
+                    max_dihedral = dihedral
 
-            if not is_uv_seam and uv_layer and len(v.link_faces) > 1:
-                # Detect UV discontinuity across adjacent faces
-                uv_coords = []
-                for loop in v.link_loops:
-                    uv_coords.append(loop[uv_layer].uv)
-                
-                # If distinct UV loops differ by more than epsilon, vertex sits on a UV cut
-                first_uv = uv_coords[0]
-                for other_uv in uv_coords[1:]:
-                    if (first_uv - other_uv).length > 1e-4:
-                        is_uv_seam = True
-                        break
+        if eff_preserve_sil > 0.0:
+            if is_sharp_edge:
+                w_curve = eff_preserve_sil
+            elif max_dihedral >= eff_sil_angle:
+                ratio = min(1.0, max_dihedral / (math.pi * 0.5))
+                w_curve = ratio * eff_preserve_sil
+            elif max_dihedral > math.radians(2.0):
+                # Ponderation douce sur les surfaces courbes lisses (spheres, cylindres)
+                # pour eviter que tout le mesh soit a 0.0 face a une couture a 0.85
+                soft_ratio = (max_dihedral / max(1e-4, eff_sil_angle)) * 0.35
+                w_curve = soft_ratio * eff_preserve_sil
 
-            if is_uv_seam:
-                w_uv = eff_preserve_uv
+        # --- 3. UV Seam Check (base uniquement sur les vraies aretes de couture) ---
+        if eff_preserve_uv > 0.0 and not is_smooth_pole:
+            seam_edges_on_vert = [e for e in v.link_edges if e.seam]
+            if seam_edges_on_vert:
+                # Plafonner w_uv a 0.65 pour que les sommets puissent glisser et se reduire
+                # LE LONG de la couture pendant que delimit={'UV'} empeche de la traverser
+                w_uv = min(0.65, eff_preserve_uv)
 
-            # 2b. Protection of 2D UV border curvature (turns > 5 degrees)
-            if uv_border_curvature and uv_layer and (is_uv_seam or w_boundary > 0.0):
-                # Inspect each incident face: if it contains two border/seam edges incident to v,
-                # they represent consecutive boundary segments within the SAME UV island.
-                for f in v.link_faces:
-                    b_edges_in_face = [
-                        e for e in f.edges
-                        if v in e.verts and (e.seam or len(e.link_faces) == 1)
-                    ]
-                    if len(b_edges_in_face) >= 2:
-                        lp_v = None
-                        for lp in f.loops:
-                            if lp.vert == v:
-                                lp_v = lp
-                                break
-                        if lp_v:
-                            uv_v = lp_v[uv_layer].uv
-                            dirs = []
-                            for be in b_edges_in_face[:2]:
-                                other_v = be.other_vert(v)
-                                for lp in f.loops:
-                                    if lp.vert == other_v:
-                                        d = lp[uv_layer].uv - uv_v
-                                        if d.length > 1e-6:
-                                            dirs.append(d)
-                                        break
-                            if len(dirs) == 2:
+                # Protection des virages 2D UV uniquement si l'arete 3D est aussi un angle vif
+                if uv_border_curvature and uv_layer and len(seam_edges_on_vert) == 2 and max_dihedral > math.radians(20.0):
+                    e1, e2 = seam_edges_on_vert[0], seam_edges_on_vert[1]
+                    if len(e1.link_faces) >= 1 and len(e2.link_faces) >= 1:
+                        f_ref = e1.link_faces[0]
+                        v1 = e1.other_vert(v)
+                        v2 = e2.other_vert(v)
+                        uv_v = uv_1 = uv_2 = None
+                        for lp in f_ref.loops:
+                            if lp.vert == v: uv_v = lp[uv_layer].uv
+                            elif lp.vert == v1: uv_1 = lp[uv_layer].uv
+                            elif lp.vert == v2: uv_2 = lp[uv_layer].uv
+                        if uv_v and uv_1 and uv_2:
+                            d1 = uv_1 - uv_v
+                            d2 = uv_2 - uv_v
+                            if d1.length > 1e-6 and d2.length > 1e-6:
                                 dev = calculate_uv_angle_deviation(
-                                    Vector((dirs[0].x, dirs[0].y, 0.0)),
-                                    Vector((dirs[1].x, dirs[1].y, 0.0))
+                                    Vector((d1.x, d1.y, 0.0)),
+                                    Vector((d2.x, d2.y, 0.0))
                                 )
-                                # If border curves > 5 degrees, lock vertex to prevent cutting outside texture
-                                if dev > math.radians(5.0):
-                                    w_uv_curve = 1.0
-                                    break
+                                if dev > math.radians(15.0):
+                                    w_uv_curve = 0.80
 
-        # --- 3. Material Boundary Check ---
+        # --- 4. Material Boundary Check ---
         if eff_preserve_mat > 0.0 and len(v.link_faces) > 1:
             mat_indices = {f.material_index for f in v.link_faces}
             if len(mat_indices) > 1:
                 w_mat = eff_preserve_mat
 
-        # --- 4. Curvature & Sharp Silhouette Check ---
-        if eff_preserve_sil > 0.0:
-            max_dihedral = 0.0
-            is_sharp_edge = False
-
-            for e in v.link_edges:
-                if not e.smooth:
-                    is_sharp_edge = True
-                
-                if len(e.link_faces) == 2:
-                    n1 = e.link_faces[0].normal
-                    n2 = e.link_faces[1].normal
-                    dot_val = clamp(n1.dot(n2), -1.0, 1.0)
-                    dihedral = math.acos(dot_val)
-                    if dihedral > max_dihedral:
-                        max_dihedral = dihedral
-
-            if is_sharp_edge:
-                w_curve = eff_preserve_sil
-            elif max_dihedral >= eff_sil_angle:
-                # Proportional curve importance up to 90 degrees
-                ratio = min(1.0, max_dihedral / (math.pi * 0.5))
-                w_curve = ratio * eff_preserve_sil
-
         # --- 5. Skinning / Bone Joint Check ---
         if skinning_scores and idx < len(skinning_scores):
             w_skin = skinning_scores[idx] * preserve_skinning
 
-        # Combine all weighted criteria
-        combined_weight = max(w_boundary, w_uv, w_uv_curve, w_mat, w_curve, w_skin)
-        combined_weight = clamp(combined_weight, 0.0, 1.0)
+        if is_smooth_pole:
+            # Laisser le pole d'une sphere se simplifier librement avec ses voisins
+            combined_weight = 0.0
+        else:
+            combined_weight = max(w_boundary, w_uv, w_uv_curve, w_mat, w_curve, w_skin)
+            combined_weight = clamp(combined_weight, 0.0, 1.0)
 
         # Apply progressive relaxation for LOD2
         if lod_level == 2 and relax_weights:

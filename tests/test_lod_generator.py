@@ -378,6 +378,43 @@ def test_uv_preservation_suite():
     assert weights_lod3[s0.index] >= 0.5, f"Le sommet de couture au LOD3 doit conserver un poids >= 0.5 (w={weights_lod3[s0.index]})"
     bm_seam_test.free()
     print("  Detection coutures UV & plancher LOD3 (w >= 0.5) valides [OK]")
+
+    # 5. Test UV Sphere pole detection and fix_flipped_faces_and_smoothing (Issue 5)
+    from lod_generator_addon.core.decimator import fix_flipped_faces_and_smoothing
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=16, radius=1.0)
+    sphere_obj = bpy.context.active_object
+    bm_sph = bmesh.new()
+    bm_sph.from_mesh(sphere_obj.data)
+    bm_sph.verts.ensure_lookup_table()
+
+    weights_sph = compute_vertex_protection_weights(bm_sph, obj=sphere_obj)
+    north_pole = [v for v in bm_sph.verts if v.co.z > 0.99][0]
+    south_pole = [v for v in bm_sph.verts if v.co.z < -0.99][0]
+    assert weights_sph[north_pole.index] == 0.0, f"Le pole Nord lisse doit avoir un poids de 0.0 (w={weights_sph[north_pole.index]})"
+    assert weights_sph[south_pole.index] == 0.0, f"Le pole Sud lisse doit avoir un poids de 0.0 (w={weights_sph[south_pole.index]})"
+    bm_sph.free()
+
+    # Test fix_flipped_faces_and_smoothing on a flipped face
+    sphere_lod = sphere_obj.copy()
+    sphere_lod.data = sphere_obj.data.copy()
+    bpy.context.collection.objects.link(sphere_lod)
+    bm_flip = bmesh.new()
+    bm_flip.from_mesh(sphere_lod.data)
+    bm_flip.faces.ensure_lookup_table()
+    bm_flip.faces[0].normal_flip()
+    bm_flip.to_mesh(sphere_lod.data)
+    bm_flip.free()
+
+    repaired_flips = fix_flipped_faces_and_smoothing(sphere_lod, sphere_obj)
+    assert repaired_flips == 1, f"La face inversee aurait du etre reparee (repaired={repaired_flips})"
+
+    mesh_sph = sphere_obj.data
+    mesh_lod = sphere_lod.data
+    bpy.data.objects.remove(sphere_obj, do_unlink=True)
+    bpy.data.objects.remove(sphere_lod, do_unlink=True)
+    if mesh_sph.users == 0: bpy.data.meshes.remove(mesh_sph)
+    if mesh_lod.users == 0: bpy.data.meshes.remove(mesh_lod)
+    print("  Singularites polaires (w=0.0) & reorientation des faces (normal_flip) valides [OK]")
     print("[OK] Validation mathematique du module de preservation des UVs.")
 
 
