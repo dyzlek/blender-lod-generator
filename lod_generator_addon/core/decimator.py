@@ -1,13 +1,5 @@
 """
 Decimator Pipeline Module for Procedural LOD Generator.
-Executes the multi-stage geometry simplification pipeline:
-0. Clean Pre-Triangulation (Beauty + Keep Normals)
-1. Small mesh islands culling (BFS size filtering)
-2. Coplanar face pre-dissolve (Planar decimation for hard-surface)
-3. QEM edge collapse with delimit={'UV', 'MATERIAL', 'SEAM'} and protection mask
-4. Optional physical isolation (Split -> Decimate -> Weld)
-5. Post-decimation UV repair via BVHTree and barycentric projection
-6. Normal projection / restoration via Data Transfer
 """
 
 import math
@@ -16,7 +8,7 @@ import bpy
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.geometry import barycentric_transform
-from .analyzer import find_connected_islands, clean_mesh_topology
+from .analyzer import find_connected_islands
 from .weight_mapper import (
     apply_protection_mask_to_object,
     PROTECTION_VG_NAME,
@@ -26,7 +18,6 @@ from ..utils.math_helpers import (
     clamp,
     get_triangulated_face_count,
     calculate_coords_bounding_sphere,
-    calculate_bounding_sphere,
     calculate_uv_signed_area,
     calculate_triangle_3d_area,
 )
@@ -34,9 +25,8 @@ from ..utils.math_helpers import (
 
 def cull_small_islands_from_object(obj: bpy.types.Object, threshold_pct: float) -> int:
     """
-    Identifies and removes detached sub-elements (rivets, bolts, tiny handles)
-    whose relative bounding radius is smaller than threshold_pct % of the overall mesh.
-    Returns the number of culled islands.
+    Identifies and removes detached sub-elements whose relative bounding radius
+    is smaller than threshold_pct % of the overall mesh.
     """
     if not obj or obj.type != 'MESH' or threshold_pct <= 0.0:
         return 0
@@ -63,7 +53,6 @@ def cull_small_islands_from_object(obj: bpy.types.Object, threshold_pct: float) 
 
     culled_count = 0
     verts_to_delete = []
-
     ratio_threshold = threshold_pct / 100.0
 
     for island in islands:
@@ -84,15 +73,15 @@ def cull_small_islands_from_object(obj: bpy.types.Object, threshold_pct: float) 
     return culled_count
 
 
-def fix_flipped_faces_and_smoothing(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
+def unfold_and_harmonize_shading(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
     """
-    Corrige les triangles qui se sont replies/inverses (normale a 180 deg) pendant la decimation
-    et harmonise l'etat Smooth Shading (f.smooth) avec le LOD0 pour eviter les triangles plats gris clairs.
+    Unfolds any geometrically inverted triangles (foldovers) by relaxing their vertices
+    without breaking manifold winding order (never flips a single face inside a closed mesh),
+    recalculates consistent manifold normals, and harmonizes Smooth Shading with LOD0.
     """
     if not target_obj or not lod0_obj:
         return 0
 
-    # Verifier si le LOD0 utilise le Smooth Shading
     lod0_is_smooth = any(p.use_smooth for p in lod0_obj.data.polygons)
 
     bm0 = bmesh.new()
@@ -105,47 +94,61 @@ def fix_flipped_faces_and_smoothing(target_obj: bpy.types.Object, lod0_obj: bpy.
     bm.faces.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
 
-    # 1. Supprimer les faces degenerees d'aire nulle (aretes ecrasees)
+    # 1. Remove zero-area degenerate faces
     degenerate_faces = [f for f in bm.faces if f.calc_area() <= 1e-8]
     if degenerate_faces:
         bmesh.ops.delete(bm, geom=degenerate_faces, context='FACES')
         bm.faces.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
 
-    # 2. Reorienter les triangles inverses par rapport a la normale du LOD0
-    flipped_count = 0
+    # 2. Detect geometrically folded faces (where face normal opposes LOD0 normal)
+    # Instead of flipping winding of a single triangle (which creates non-manifold bright gray faces),
+    # we relax its vertices toward their connected neighbors and re-project onto LOD0 surface.
+    folded_verts = set()
     for f in bm.faces:
         f.smooth = lod0_is_smooth
         center = f.calc_center_median()
         _, norm0, _, _ = bvh0.find_nearest(center)
         if norm0 is not None and f.normal.length > 0.0:
-            if f.normal.dot(norm0) < -0.15:
-                f.normal_flip()
-                flipped_count += 1
+            if f.normal.dot(norm0) < -0.1:
+                for v in f.verts:
+                    folded_verts.add(v)
 
+    if folded_verts:
+        for _ in range(2):
+            new_positions = {}
+            for v in folded_verts:
+                neighbors = [e.other_vert(v).co for e in v.link_edges]
+                if neighbors:
+                    avg_co = sum(neighbors, Vector((0.0, 0.0, 0.0))) / len(neighbors)
+                    relaxed = v.co.lerp(avg_co, 0.5)
+                    loc, _, _, _ = bvh0.find_nearest(relaxed)
+                    new_positions[v] = loc if loc is not None else relaxed
+            for v, pos in new_positions.items():
+                v.co = pos
+
+    # 3. Ensure globally consistent manifold winding across the entire mesh
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
     bm.normal_update()
+
     bm.to_mesh(target_obj.data)
     target_obj.data.update()
 
     bm0.free()
     bm.free()
-    return flipped_count
+    return len(folded_verts)
 
 
 def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
     """
-    Scans the decimated mesh for UV foldovers or degenerated UV faces (e.g. barcode artifacts
-    where UV area is near zero while 3D area is non-zero).
-    Uses a BVHTree constructed on a pre-triangulated copy of LOD0 to find corresponding surface coordinates
-    and re-projects clean barycentric UVs sampled from the interior of the face.
-    Returns the number of repaired faces.
+    Scans the decimated mesh for strictly degenerate UV faces (zero UV area)
+    and re-projects barycentric UVs using the exact hit face on a triangulated LOD0 BVHTree.
     """
     if not target_obj or not lod0_obj or not target_obj.data.uv_layers:
         return 0
 
     bm0 = bmesh.new()
     bm0.from_mesh(lod0_obj.data)
-    # Triangulate bm0 to guarantee that every source face f0 has exactly 3 vertices
     bmesh.ops.triangulate(bm0, faces=bm0.faces)
     bm0.faces.ensure_lookup_table()
     bm0.verts.ensure_lookup_table()
@@ -181,33 +184,27 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
         area_uv = abs(calculate_uv_signed_area(uv0, uv1, uv2))
         area_3d = calculate_triangle_3d_area(v0, v1, v2)
 
-        # 2D Aspect Ratio: a triangle is a barcode artifact only if area_uv is nearly zero or
-        # flattened beyond 99.99% relative to its maximum UV edge length
         max_uv_edge = max((uv1 - uv0).length, (uv2 - uv1).length, (uv0 - uv2).length)
-        is_barcode = (max_uv_edge > 1e-4 and (2.0 * area_uv / (max_uv_edge ** 2)) < 1e-4)
-        is_zero_uv = (area_uv < 1e-10 and area_3d > 1e-5)
+        is_barcode = (max_uv_edge > 1e-3 and (2.0 * area_uv / (max_uv_edge ** 2)) < 1e-6)
+        is_zero_uv = (area_uv < 1e-11 and area_3d > 1e-5)
 
         if is_barcode or is_zero_uv:
-            # Locate source face at the geometric center of the 3D triangle to eliminate seam ambiguity
             face_center = (v0 + v1 + v2) / 3.0
-            _, _, center_face_idx, _ = bvh0.find_nearest(face_center)
+            for loop in f.loops:
+                # Sample slightly inward toward face center and use the EXACT hit face (hit_face_idx)
+                sample_pt = loop.vert.co.lerp(face_center, 0.15)
+                loc, _, hit_face_idx, _ = bvh0.find_nearest(sample_pt)
+                if loc is not None and hit_face_idx is not None and hit_face_idx < len(bm0.faces):
+                    f_hit = bm0.faces[hit_face_idx]
+                    pA, pB, pC = f_hit.verts[0].co, f_hit.verts[1].co, f_hit.verts[2].co
+                    uvA = Vector((f_hit.loops[0][uv_layer0].uv.x, f_hit.loops[0][uv_layer0].uv.y, 0.0))
+                    uvB = Vector((f_hit.loops[1][uv_layer0].uv.x, f_hit.loops[1][uv_layer0].uv.y, 0.0))
+                    uvC = Vector((f_hit.loops[2][uv_layer0].uv.x, f_hit.loops[2][uv_layer0].uv.y, 0.0))
 
-            if center_face_idx is not None and center_face_idx < len(bm0.faces):
-                f0 = bm0.faces[center_face_idx]
-                pA, pB, pC = f0.verts[0].co, f0.verts[1].co, f0.verts[2].co
-                uvA = Vector((f0.loops[0][uv_layer0].uv.x, f0.loops[0][uv_layer0].uv.y, 0.0))
-                uvB = Vector((f0.loops[1][uv_layer0].uv.x, f0.loops[1][uv_layer0].uv.y, 0.0))
-                uvC = Vector((f0.loops[2][uv_layer0].uv.x, f0.loops[2][uv_layer0].uv.y, 0.0))
+                    uv_repaired = barycentric_transform(loc, pA, pB, pC, uvA, uvB, uvC)
+                    loop[uv_layer_target].uv = uv_repaired.xy
 
-                for loop in f.loops:
-                    # Inward sampling: slight pull (5%) towards face center prevents jumping over seams
-                    sample_pt = loop.vert.co.lerp(face_center, 0.05)
-                    loc, _, _, _ = bvh0.find_nearest(sample_pt)
-                    if loc is not None:
-                        uv_repaired = barycentric_transform(loc, pA, pB, pC, uvA, uvB, uvC)
-                        loop[uv_layer_target].uv = uv_repaired.xy
-
-                repaired_count += 1
+            repaired_count += 1
 
     if repaired_count > 0:
         bm_target.to_mesh(target_obj.data)
@@ -216,6 +213,20 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
     bm0.free()
     bm_target.free()
     return repaired_count
+
+
+def clear_custom_normals_safely(context, obj: bpy.types.Object):
+    """Clears any pre-existing custom split normals before topological decimation."""
+    if not obj or obj.type != 'MESH' or not obj.data.has_custom_normals:
+        return
+    prev_active = context.view_layer.objects.active
+    context.view_layer.objects.active = obj
+    obj.select_set(True)
+    try:
+        bpy.ops.mesh.customdata_custom_splitnormals_clear()
+    except Exception:
+        pass
+    context.view_layer.objects.active = prev_active
 
 
 def apply_modifier_safely(context, obj: bpy.types.Object, mod_name: str) -> bool:
@@ -270,31 +281,21 @@ def generate_lod_mesh(
 ) -> tuple[bpy.types.Object, dict]:
     """
     Executes the complete generation of a single LOD level from a source mesh.
-    Returns the newly created LOD object and a dictionary of performance metrics.
     """
-    # 1. Clean duplication
+    # 1. Clean duplication (keep identical local space with lod0_obj)
     new_mesh = source_obj.data.copy()
     new_mesh.name = f"{lod_name}_Mesh"
     new_obj = source_obj.copy()
     new_obj.data = new_mesh
     new_obj.name = lod_name
-
-    # Clear existing unapplied modifiers from duplicate
     new_obj.modifiers.clear()
 
-    # Link to active collection temporarily
     context.collection.objects.link(new_obj)
 
-    # Normalize scale on duplicate mesh if non-uniform to ensure accurate metric thresholds
-    if (new_obj.scale - Vector((1.0, 1.0, 1.0))).length > 1e-5:
-        from mathutils import Matrix
-        scale_mat = Matrix.Diagonal((*new_obj.scale, 1.0))
-        new_mesh.transform(scale_mat)
-        new_mesh.update()
-        new_obj.scale = Vector((1.0, 1.0, 1.0))
+    # Clear pre-existing custom normals so BMesh operations don't corrupt tangent loop normals
+    clear_custom_normals_safely(context, new_obj)
 
-    # 2. Pass 0 — Clean Pre-Triangulation (Beauty + Keep Normals)
-    # Eliminates non-planar quads and concave N-Gons to prevent barcode UV artifacts
+    # 2. Pass 0 — Clean Pre-Triangulation
     if pre_triangulate:
         mod_tri = new_obj.modifiers.new(name="LOD_Pre_Triangulate", type='TRIANGULATE')
         mod_tri.quad_method = 'BEAUTY'
@@ -311,7 +312,6 @@ def generate_lod_mesh(
         culled_islands = cull_small_islands_from_object(new_obj, effective_cull_pct)
 
     # 4. Pass 1 — Coplanar Face Dissolve (Planar Pre-Decimate)
-    # Only applied if enabled and below strict angle (<= 0.5 deg)
     if pre_planar_dissolve:
         mod_planar = new_obj.modifiers.new(name="LOD_Planar_Dissolve", type='DECIMATE')
         mod_planar.decimate_type = 'DISSOLVE'
@@ -319,18 +319,16 @@ def generate_lod_mesh(
         mod_planar.delimit = {'UV', 'MATERIAL', 'SEAM', 'SHARP'}
         apply_modifier_safely(context, new_obj, mod_planar.name)
 
-    # Pre-mark UV discontinuities as seams so that both physical isolation and Delimit detect all UV cuts
+    # 5. Pre-mark UV discontinuities as seams & weld sawtooth pole UVs
     if use_delimit_uv and new_obj.data.uv_layers:
         bm_seam = bmesh.new()
         bm_seam.from_mesh(new_obj.data)
-        bm_seam.edges.ensure_lookup_table()
-        marked = mark_uv_discontinuities_as_seams(bm_seam)
-        if marked > 0:
-            bm_seam.to_mesh(new_obj.data)
-            new_obj.data.update()
+        mark_uv_discontinuities_as_seams(bm_seam)
+        bm_seam.to_mesh(new_obj.data)
+        new_obj.data.update()
         bm_seam.free()
 
-    # 5. Optional Split-Decimate-Weld Physical Isolation
+    # 6. Optional Split-Decimate-Weld Physical Isolation
     if split_weld_isolation:
         bm_split = bmesh.new()
         bm_split.from_mesh(new_obj.data)
@@ -342,7 +340,7 @@ def generate_lod_mesh(
             new_obj.data.update()
         bm_split.free()
 
-    # 6. Generate Procedural Protection Weight Mask
+    # 7. Generate Procedural Protection Weight Mask
     apply_protection_mask_to_object(
         obj=new_obj,
         preserve_uv=preserve_uv,
@@ -356,7 +354,7 @@ def generate_lod_mesh(
         relax_weights=relax_weights
     )
 
-    # 7. Pass 2 — QEM Guided Collapse Decimation with Delimit Barrier
+    # 8. Pass 2 — QEM Guided Collapse Decimation with Delimit Barrier
     target_triangles = max(8, int(original_lod0_triangles * target_ratio))
     current_triangles = get_triangulated_face_count(new_obj)
 
@@ -365,18 +363,17 @@ def generate_lod_mesh(
         mod_qem = new_obj.modifiers.new(name="LOD_QEM_Collapse", type='DECIMATE')
         mod_qem.decimate_type = 'COLLAPSE'
         mod_qem.ratio = eff_collapse_ratio
-        mod_qem.use_collapse_triangulate = True
+        mod_qem.use_collapse_triangulate = False
         mod_qem.vertex_group = PROTECTION_VG_NAME
         mod_qem.invert_vertex_group = True
-        mod_qem.vertex_group_factor = 0.70
+        mod_qem.vertex_group_factor = 0.50
 
-        # Native C++ boundary barrier: keep 'UV' on ALL LOD levels to prevent bridges between UV islands
         if use_delimit_uv:
             mod_qem.delimit = {'UV', 'MATERIAL', 'SEAM'}
 
         apply_modifier_safely(context, new_obj, mod_qem.name)
 
-    # 8. Re-weld after Split if isolation was active
+    # 9. Re-weld after Split if isolation was active
     if split_weld_isolation:
         bm_weld = bmesh.new()
         bm_weld.from_mesh(new_obj.data)
@@ -386,19 +383,24 @@ def generate_lod_mesh(
         new_obj.data.update()
         bm_weld.free()
 
-    # 8.5 Repair flipped faces (foldovers) and harmonize smooth shading before normal transfer
+    # 10. Unfold any folded triangles and harmonize manifold winding & smooth shading
     if lod0_obj:
-        fix_flipped_faces_and_smoothing(new_obj, lod0_obj)
+        unfold_and_harmonize_shading(new_obj, lod0_obj)
 
-    # 9. Pass 3 — Post-Decimation UV Repair via BVH Tree (Rule D)
+    # 11. Pass 3 — Post-Decimation UV Repair via BVH Tree
     repaired_uvs = 0
     if bvh_repair_uv and lod0_obj:
         repaired_uvs = repair_corrupted_uvs_via_bvh(new_obj, lod0_obj)
 
-    # 10. Pass 4 — Shading Restoration (Custom Normal Transfer)
+    # Validate mesh BEFORE Data Transfer so custom split normals are written onto valid loops
+    new_obj.data.validate()
+    new_obj.data.update()
+
+    # 12. Pass 4 — Shading Restoration (Custom Normal Transfer)
     if normal_strategy == 'TRANSFER' and lod0_obj:
         mod_norm = new_obj.modifiers.new(name="LOD_Normal_Transfer", type='DATA_TRANSFER')
         mod_norm.object = lod0_obj
+        mod_norm.use_object_transform = False
         mod_norm.use_loop_data = True
         mod_norm.data_types_loops = {'CUSTOM_NORMAL'}
         mod_norm.loop_mapping = 'POLYINTERP_NEAREST'
@@ -409,16 +411,13 @@ def generate_lod_mesh(
         mod_wn.keep_sharp = True
         apply_modifier_safely(context, new_obj, mod_wn.name)
 
-    # 11. Clean up temporary vertex group
+    # 13. Clean up temporary vertex group
     if not keep_protection_mask and PROTECTION_VG_NAME in new_obj.vertex_groups:
         vg = new_obj.vertex_groups.get(PROTECTION_VG_NAME)
         new_obj.vertex_groups.remove(vg)
 
-    # Validate mesh data to ensure clean export without dangling indices
-    new_obj.data.validate()
     new_obj.data.update()
 
-    # Compute final metrics
     final_triangles = get_triangulated_face_count(new_obj)
     reduction_pct = (1.0 - (final_triangles / max(1, original_lod0_triangles))) * 100.0
 
@@ -433,3 +432,6 @@ def generate_lod_mesh(
     }
 
     return new_obj, stats
+
+# Alias de retrocompatibilite
+fix_flipped_faces_and_smoothing = unfold_and_harmonize_shading
