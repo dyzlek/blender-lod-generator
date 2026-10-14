@@ -7,7 +7,7 @@ BFS island culling, QEM edge collapse, custom normal projection, and LodGroup Em
 bl_info = {
     "name": "Procedural LOD Generator Pro",
     "author": "Dylan",
-    "version": (1, 1, 3),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (N) > LOD Generator",
     "description": "Générateur procédural avancé de LODs pour moteurs de jeux (Unreal, Unity, Godot) avec protection UV/silhouette et hiérarchie LodGroup.",
@@ -17,23 +17,16 @@ bl_info = {
 }
 
 import sys
-import importlib
 
-# Reload submodules if reloaded in Blender
-module_names = [
-    "properties",
-    "utils",
-    "core",
-    "operators",
-    "ui"
-]
-
-current_module = __name__
-
-for sub_name in module_names:
-    full_name = f"{current_module}.{sub_name}"
-    if full_name in sys.modules:
-        importlib.reload(sys.modules[full_name])
+# When Blender re-executes this file (add-on updated, reloaded or re-enabled), drop every
+# submodule from sys.modules so they are all imported fresh. Reloading only the
+# subpackages would leave leaf modules such as core.decimator in their old version.
+# The package attributes must go too: on reload this namespace still holds the old
+# subpackages, and "from . import x" would reuse them instead of importing.
+for _name in [m for m in sys.modules if m.startswith(__name__ + ".")]:
+    del sys.modules[_name]
+    if "." not in _name[len(__name__) + 1:]:
+        globals().pop(_name[len(__name__) + 1:], None)
 
 from . import properties
 from . import operators

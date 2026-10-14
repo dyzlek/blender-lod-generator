@@ -418,6 +418,136 @@ def test_uv_preservation_suite():
     print("[OK] Validation mathematique du module de preservation des UVs.")
 
 
+def _make_sphere(name, subdivisions=4):
+    mesh = bpy.data.meshes.new(f"{name}_Mesh")
+    bm = bmesh.new()
+    bmesh.ops.create_icosphere(bm, subdivisions=subdivisions, radius=1.0)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.uv_layers.new(name="UVMap")
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def _remove_object(obj):
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def test_generation_steps_and_cancel():
+    print("\n--- Test 9: Generation par etapes, progression et annulation (v1.3, #8) ---")
+    from lod_generator_addon.core.decimator import iter_generate_lod_mesh, PROGRESS_BATCH
+    from lod_generator_addon.utils.math_helpers import get_triangulated_face_count
+
+    src = _make_sphere("TestSteps_LOD0", subdivisions=5)
+    tris = get_triangulated_face_count(src)
+
+    # 1. Progression monotone de 0 a 1, libelles presents, resultat final
+    steps = iter_generate_lod_mesh(bpy.context, src, src, "TestSteps_LOD1", 0.5, 1, tris)
+    fractions, labels = [], []
+    while True:
+        try:
+            label, fraction = next(steps)
+        except StopIteration as stop:
+            lod, stats = stop.value
+            break
+        labels.append(label)
+        fractions.append(fraction)
+    assert fractions == sorted(fractions), "Progression non monotone !"
+    assert fractions[-1] == 1.0 and "Décimation QEM" in labels and "Transfert des normales" in labels
+    assert stats["triangles"] <= tris * 0.55, "LOD non reduit !"
+    _remove_object(lod)
+
+    # 2. Annulation au milieu du transfert des normales : rien ne doit rester
+    meshes_before = set(bpy.data.meshes.keys())
+    steps = iter_generate_lod_mesh(bpy.context, src, src, "TestSteps_LOD2", 0.5, 2, tris)
+    for label, fraction in steps:
+        if label == "Transfert des normales" and fraction > 0.80:
+            break
+    assert bpy.data.objects.get("TestSteps_LOD2") is not None, "Le LOD partiel devrait exister avant l'annulation"
+    steps.close()
+    assert bpy.data.objects.get("TestSteps_LOD2") is None, "LOD partiel non supprime apres annulation !"
+    assert set(bpy.data.meshes.keys()) == meshes_before, "Mesh orphelin laisse apres annulation !"
+
+    # 3. Chemin synchrone de l'operateur (scripts / tests) toujours fonctionnel
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = src
+    src.select_set(True)
+    settings = bpy.context.scene.lod_generator_settings
+    settings.lod_count = 2
+    result = bpy.ops.lod.generate()
+    assert result == {'FINISHED'}, f"Generation synchrone echouee : {result}"
+    assert not settings.is_generating, "is_generating reste actif apres la generation synchrone"
+    assert bpy.data.objects.get("TestSteps_LOD2") is not None
+    bpy.ops.lod.clear_lods()
+    _remove_object(src)
+    print(f"  {len(fractions)} etapes, annulation propre, lot de progression = {PROGRESS_BATCH} faces [OK]")
+    print("✓ Generation par etapes et annulation validees.")
+
+
+def test_live_preview_geometry():
+    print("\n--- Test 10: Apercu en direct, geometrie temporaire (v1.3, #7) ---")
+    from lod_generator_addon.ui import hud_overlay
+
+    src = _make_sphere("TestPreview_LOD0", subdivisions=4)
+    settings = bpy.context.scene.lod_generator_settings
+    objects_before = set(bpy.data.objects.keys())
+    meshes_before = set(bpy.data.meshes.keys())
+
+    geometry = hud_overlay.compute_preview_geometry(bpy.context, src, settings, 2)
+    assert geometry["edges"] and geometry["coords"], "Apercu vide !"
+    assert geometry["triangles"] < geometry["source_triangles"], "Apercu non reduit !"
+    assert set(bpy.data.objects.keys()) == objects_before, "Objet temporaire d'apercu laisse dans la scene !"
+    assert set(bpy.data.meshes.keys()) == meshes_before, "Mesh temporaire d'apercu laisse dans le fichier !"
+
+    # Activer / desactiver l'apercu ne doit pas laisser de timer ni de draw handler
+    settings.preview_enabled = True
+    assert bpy.app.timers.is_registered(hud_overlay._watch)
+    settings.preview_enabled = False
+    assert not bpy.app.timers.is_registered(hud_overlay._watch), "Timer d'apercu non retire !"
+    assert not hud_overlay._draw_handles, "Draw handlers d'apercu non retires !"
+
+    _remove_object(src)
+    print(f"  LOD2 : {geometry['triangles']} / {geometry['source_triangles']} tris, {len(geometry['edges'])} aretes [OK]")
+    print("✓ Apercu en direct valide (aucune donnee temporaire laissee).")
+
+
+def test_version_check_and_reload():
+    print("\n--- Test 11: Detection d'ancienne version et rechargement complet (v1.3, #9) ---")
+    import importlib
+    import lod_generator_addon
+    from lod_generator_addon.utils import version
+
+    state = version.check_version_state(force=True)
+    assert state["disk"] == tuple(lod_generator_addon.bl_info["version"]), "Version disque mal lue !"
+    assert not state["mismatch"], f"Fausse alerte de version : {state}"
+
+    # Module perime simule : version en memoire differente de celle du disque
+    real_version = version.LOADED_VERSION
+    version.LOADED_VERSION = (0, 0, 1)
+    try:
+        assert version.check_version_state(force=True)["mismatch"], "Version perimee non detectee !"
+    finally:
+        version.LOADED_VERSION = real_version
+    # Fichiers modifies apres le chargement
+    assert version.find_stale_modules(loaded_at=0.0), "Modules modifies sur disque non detectes !"
+
+    # Re-execution du paquet (mise a jour) : TOUS les sous-modules doivent etre reimportes
+    lod_generator_addon.unregister()
+    old_decimator = sys.modules["lod_generator_addon.core.decimator"]
+    importlib.reload(lod_generator_addon)
+    new_decimator = sys.modules["lod_generator_addon.core.decimator"]
+    assert new_decimator is not old_decimator, "core.decimator non recharge (ancienne version en memoire) !"
+    assert lod_generator_addon.core.decimator is new_decimator, "Le paquet reference encore l'ancien sous-module !"
+    lod_generator_addon.register()
+    assert hasattr(bpy.ops.lod, "reload_addon") and hasattr(bpy.ops.lod, "cancel_generation")
+    print("✓ Detection de version et rechargement complet valides.")
+
+
 def test_double_walled_shell():
     print("\n--- Test 8b: Coque a double paroi (ballon, solidify) ---")
     from lod_generator_addon.core.decimator import generate_lod_mesh
@@ -487,6 +617,9 @@ def main():
         test_uv_preservation_suite()
         test_double_walled_shell()
         test_cleanup()
+        test_generation_steps_and_cancel()
+        test_live_preview_geometry()
+        test_version_check_and_reload()
 
         print("\n" + "=" * 70)
         print("  TOUS LES TESTS SONT PASSES AVEC SUCCES.")
