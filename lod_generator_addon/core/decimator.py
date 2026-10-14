@@ -9,6 +9,8 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.geometry import barycentric_transform
 from .analyzer import find_connected_islands
+from .remesher import remesh_object
+from .error_metrics import measure_deviation
 from .weight_mapper import (
     apply_protection_mask_to_object,
     PROTECTION_VG_NAME,
@@ -395,6 +397,50 @@ def _scaled(steps, label: str, start: float, end: float):
             raise
 
 
+# Number of ratio trials of the error-budget search (dichotomy on a log scale)
+ERROR_SEARCH_STEPS = 7
+ERROR_SEARCH_MIN_RATIO = 0.002
+
+
+def iter_find_ratio_for_error(context, source_obj, lod0_obj, max_error: float, lod_level: int,
+                              original_lod0_triangles: int, max_ratio: float = 1.0, **pipeline_kwargs):
+    """
+    Finds the smallest decimation ratio whose LOD stays within max_error of LOD0
+    (geometric dichotomy, normal transfer and UV repair skipped during the trials).
+    Yields progress fractions; returns (ratio, measured_error).
+    """
+    trial_kwargs = dict(pipeline_kwargs, normal_strategy='NONE', bvh_repair_uv=False, keep_protection_mask=False)
+
+    def trial(ratio):
+        lod, _ = generate_lod_mesh(context, source_obj, lod0_obj, "_LOD_Error_Trial", ratio, lod_level,
+                                   original_lod0_triangles, **trial_kwargs)
+        mesh = lod.data
+        error = measure_deviation(lod, lod0_obj)
+        bpy.data.objects.remove(lod, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        return error
+
+    low, high = ERROR_SEARCH_MIN_RATIO, clamp(max_ratio, ERROR_SEARCH_MIN_RATIO, 1.0)
+    yield 0.0
+    low_error = trial(low)
+    if low_error <= max_error:
+        return low, low_error
+
+    best_ratio, best_error = high, None
+    for step in range(ERROR_SEARCH_STEPS):
+        yield (step + 1) / (ERROR_SEARCH_STEPS + 1)
+        mid = math.sqrt(low * high)
+        error = trial(mid)
+        if error <= max_error:
+            high, best_ratio, best_error = mid, mid, error
+        else:
+            low = mid
+    if best_error is None:
+        best_error = trial(best_ratio)
+    return best_ratio, best_error
+
+
 def generate_lod_mesh(*args, **kwargs) -> tuple[bpy.types.Object, dict]:
     """Synchronous wrapper of iter_generate_lod_mesh (scripting, tests, Redo panel)."""
     return run_steps(iter_generate_lod_mesh(*args, **kwargs))
@@ -425,7 +471,11 @@ def iter_generate_lod_mesh(
     cull_small_parts: bool = True,
     cull_threshold_pct: float = 2.5,
     normal_strategy: str = 'TRANSFER',
-    keep_protection_mask: bool = False
+    keep_protection_mask: bool = False,
+    remesh_mode: str = 'NONE',
+    remesh_voxel_pct: float = 1.0,
+    remesh_quadriflow_ratio: float = 0.5,
+    remesh_from_level: int = 1
 ):
     """
     Executes the complete generation of a single LOD level from a source mesh.
@@ -447,6 +497,11 @@ def iter_generate_lod_mesh(
         yield "Préparation", 0.02
         # Clear pre-existing custom normals so BMesh operations don't corrupt tangent loop normals
         clear_custom_normals_safely(context, new_obj)
+
+        # 1b. Optional remesh of dirty sources (attributes transferred back from the source)
+        if remesh_mode != 'NONE' and lod_level >= remesh_from_level:
+            yield "Remesh", 0.03
+            remesh_object(context, new_obj, remesh_mode, remesh_voxel_pct, remesh_quadriflow_ratio)
 
         yield "Pré-triangulation", 0.05
         # 2. Pass 0 — Clean Pre-Triangulation

@@ -12,8 +12,10 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 from bpy.app.handlers import persistent
 
-from ..core.decimator import generate_lod_mesh
-from ..utils.math_helpers import calculate_ratios, get_triangulated_face_count
+from ..core.decimator import generate_lod_mesh, iter_find_ratio_for_error, run_steps
+from ..core.error_metrics import level_error_budget
+from ..utils.math_helpers import calculate_ratios, get_triangulated_face_count, default_screen_thresholds
+from ..utils.settings_map import pipeline_kwargs
 
 PREVIEW_TMP_NAME = "_LOD_Preview_Tmp"
 
@@ -31,6 +33,8 @@ WATCHED_SETTINGS = (
     "preserve_open_boundaries", "preserve_material_borders", "preserve_skinning",
     "relax_weights_per_lod", "pre_planar_dissolve", "planar_angle_limit",
     "cull_small_parts", "cull_threshold",
+    "reduction_mode", "max_error", "error_growth", "pixel_error", "screen_height_px",
+    "remesh_mode", "remesh_voxel_pct", "remesh_quadriflow_ratio", "remesh_from_level",
 )
 
 
@@ -67,12 +71,20 @@ def compute_preview_geometry(context, source_obj, settings, level: int) -> dict:
     change the wireframe.
     """
     lod_count = max(settings.lod_count, level)
-    custom_ratios = [
-        settings.custom_lod1_ratio, settings.custom_lod2_ratio, settings.custom_lod3_ratio,
-        settings.custom_lod4_ratio, settings.custom_lod5_ratio, settings.custom_lod6_ratio,
-    ]
-    ratio = calculate_ratios(settings.reduction_preset, lod_count, custom_ratios)[level - 1]
     source_triangles = get_triangulated_face_count(source_obj)
+    kwargs = dict(pipeline_kwargs(settings), bvh_repair_uv=False, normal_strategy='NONE',
+                  keep_protection_mask=False)
+
+    if settings.reduction_mode == 'RATIO':
+        custom_ratios = [
+            settings.custom_lod1_ratio, settings.custom_lod2_ratio, settings.custom_lod3_ratio,
+            settings.custom_lod4_ratio, settings.custom_lod5_ratio, settings.custom_lod6_ratio,
+        ]
+        ratio = calculate_ratios(settings.reduction_preset, lod_count, custom_ratios)[level - 1]
+    else:
+        budget = level_error_budget(settings, level, source_obj, default_screen_thresholds(lod_count + 1))
+        ratio, _ = run_steps(iter_find_ratio_for_error(
+            context, source_obj, source_obj, budget, level, source_triangles, **kwargs))
 
     tmp_obj, stats = generate_lod_mesh(
         context=context,
@@ -82,24 +94,7 @@ def compute_preview_geometry(context, source_obj, settings, level: int) -> dict:
         target_ratio=ratio,
         lod_level=level,
         original_lod0_triangles=source_triangles,
-        pre_triangulate=settings.pre_triangulate,
-        use_delimit_uv=settings.use_delimit_uv,
-        uv_border_curvature=settings.uv_border_curvature,
-        bvh_repair_uv=False,
-        split_weld_isolation=settings.split_weld_isolation,
-        preserve_uv=settings.preserve_uv_seams,
-        preserve_silhouette=settings.preserve_silhouette,
-        silhouette_angle_rad=settings.silhouette_angle,
-        preserve_boundary=settings.preserve_open_boundaries,
-        preserve_material=settings.preserve_material_borders,
-        preserve_skinning=settings.preserve_skinning,
-        relax_weights=settings.relax_weights_per_lod,
-        pre_planar_dissolve=settings.pre_planar_dissolve,
-        planar_angle_limit_rad=settings.planar_angle_limit,
-        cull_small_parts=settings.cull_small_parts,
-        cull_threshold_pct=settings.cull_threshold,
-        normal_strategy='NONE',
-        keep_protection_mask=False,
+        **kwargs
     )
 
     mesh = tmp_obj.data
