@@ -7,6 +7,8 @@ weight settings, stats breakdown table, and game engine export controls in 3D Vi
 import bpy
 from ..utils.hierarchy import get_base_name
 from ..utils.math_helpers import get_triangulated_face_count
+from ..utils.version import check_version_state, format_version
+from . import hud_overlay
 
 
 class VIEW3D_PT_lod_generator(bpy.types.Panel):
@@ -17,10 +19,30 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = 'LOD Generator'
 
+    def draw_header(self, context):
+        self.layout.label(text=f"v{format_version(check_version_state()['loaded'])}")
+
     def draw(self, context):
         layout = self.layout
         settings = context.scene.lod_generator_settings
         active_obj = context.active_object
+
+        # --- Old version still loaded in memory ---
+        version_state = check_version_state()
+        if version_state["mismatch"]:
+            box_ver = layout.box()
+            box_ver.alert = True
+            col_ver = box_ver.column(align=True)
+            disk = format_version(version_state["disk"])
+            loaded = format_version(version_state["loaded"])
+            if disk != loaded:
+                col_ver.label(text=f"Ancienne version ({loaded}) encore chargée,", icon='ERROR')
+                col_ver.label(text=f"la version {disk} est installée.")
+            else:
+                col_ver.label(text="Des fichiers de l'addon ont changé", icon='ERROR')
+                col_ver.label(text="depuis leur chargement en mémoire.")
+            col_ver.label(text="Redémarrez Blender ou rechargez l'addon :")
+            box_ver.operator("lod.reload_addon", text="Recharger l'addon", icon='FILE_REFRESH')
 
         # --- 1. Audit & Objet Actif ---
         box_audit = layout.box()
@@ -110,9 +132,21 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
             box_out.prop(settings, "collider_type")
 
         # --- Action Buttons ---
-        col_action = layout.column(align=True)
-        col_action.scale_y = 1.4
-        col_action.operator("lod.generate", text="Générer les LODs", icon='PLAY')
+        if settings.is_generating:
+            box_prog = layout.box()
+            label = settings.generation_label or "Génération..."
+            if hasattr(box_prog, "progress"):
+                box_prog.progress(factor=settings.generation_progress, type='BAR', text=label)
+            else:
+                box_prog.label(text=f"{label} ({settings.generation_progress * 100:.0f}%)", icon='TIME')
+            row_cancel = box_prog.row()
+            row_cancel.scale_y = 1.2
+            row_cancel.operator("lod.cancel_generation", text="Annuler (Échap)", icon='CANCEL')
+        else:
+            col_action = layout.column(align=True)
+            col_action.scale_y = 1.4
+            col_action.operator("lod.generate", text="Générer les LODs", icon='PLAY')
+        layout.prop(settings, "cancel_keep_completed")
 
         row_clear = layout.row()
         row_clear.operator("lod.clear_lods", text="Réinitialiser LODs", icon='TRASH')
@@ -129,6 +163,23 @@ class VIEW3D_PT_lod_generator(bpy.types.Panel):
         sim_text = "Arrêter Simulation" if settings.is_distance_sim_active else "Simuler Distance Caméra"
         sim_icon = 'PAUSE' if settings.is_distance_sim_active else 'CAMERA_DATA'
         box_view.operator("lod.camera_distance_preview", text=sim_text, icon=sim_icon)
+
+        col_prev = box_view.column(align=True)
+        row_prev = col_prev.row(align=True)
+        row_prev.prop(settings, "preview_enabled", text="Aperçu en direct", icon='MOD_WIREFRAME', toggle=True)
+        row_prev.prop(settings, "preview_level", text="LOD")
+        if settings.preview_enabled:
+            col_prev.prop(settings, "preview_color", text="Couleur")
+            info = hud_overlay.get_preview_info()
+            if info["error"]:
+                row_err = col_prev.row()
+                row_err.alert = True
+                row_err.label(text=f"Erreur : {info['error']}", icon='ERROR')
+            elif info["computing"] or not info["source_triangles"]:
+                col_prev.label(text="Calcul de l'aperçu...", icon='TIME')
+            else:
+                gain = (1.0 - info["triangles"] / max(1, info["source_triangles"])) * 100.0
+                col_prev.label(text=f"LOD{info['level']} : {info['triangles']:,} tris (-{gain:.1f}%)", icon='INFO')
 
         # --- 8. Tableau Récapitulatif Statistique ---
         if len(settings.stats_items) > 0:

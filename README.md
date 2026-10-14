@@ -89,9 +89,12 @@ Copiez le dossier `lod_generator_addon` dans le répertoire d'add-ons correspond
    - Nombre de niveaux (ex: 3 pour générer LOD1, LOD2, LOD3).
    - Profil de réduction : exponentiel ($0.5^k$), linéaire, cinématique ($0.7^k$) ou manuel.
    - Activez les options de protection topologique et de préservation UV.
-4. Cliquez sur **Générer les LODs**.
-5. Contrôlez les niveaux à l'aide des fonctions **Vue éclatée** ou **Distance caméra**.
-6. Exportez le résultat au format FBX ou glTF.
+4. *(Optionnel)* Activez **Aperçu en direct** (section 7) pour voir le LOD choisi en wireframe par-dessus l'objet, recalculé à chaque changement de réglage, avant de générer.
+5. Cliquez sur **Générer les LODs**. Une barre de progression indique l'étape en cours ; **Échap** ou **Annuler** interrompt la génération (les LODs déjà terminés sont conservés si l'option est cochée).
+6. Contrôlez les niveaux à l'aide des fonctions **Vue éclatée** ou **Distance caméra**.
+7. Exportez le résultat au format FBX ou glTF.
+
+> **Mise à jour de l'addon :** si une ancienne version est encore chargée en mémoire après l'installation d'un nouveau zip, un bandeau rouge l'indique en haut du panneau, avec un bouton **Recharger l'addon**. La version active est affichée dans l'en-tête du panneau.
 
 ---
 
@@ -132,6 +135,10 @@ Le projet comprend une suite de validation exécutable en mode arrière-plan (*h
 --- Test 6: Exportation Moteur (FBX et glTF) ---                         [OK]
 --- Test 7: Algorithmes Avances de Preservation des UVs ---              [OK]
 --- Test 8: Nettoyage et Reinitialisation ---                            [OK]
+--- Test 8b: Coque a double paroi (ballon, solidify) ---                  [OK]
+--- Test 9: Generation par etapes, progression et annulation ---          [OK]
+--- Test 10: Apercu en direct, geometrie temporaire ---                   [OK]
+--- Test 11: Detection d'ancienne version et rechargement complet ---     [OK]
 ======================================================================
   TOUS LES TESTS SONT PASSES AVEC SUCCES.
 ======================================================================

@@ -98,9 +98,12 @@ Copiez le dossier `lod_generator_addon` dans votre répertoire d'add-ons :
    - Nombre de niveaux désirés.
    - Profil de décimation (exponentiel, linéaire, cinématique, manuel).
    - Options de protection des UVs et des normales.
-4. Cliquez sur **Générer les LODs**.
-5. Contrôlez les niveaux générés avec la **Vue éclatée** ou la **Simulation de distance caméra**.
-6. Exportez vers le format de votre moteur cible (`FBX` ou `glTF`).
+4. *(Optionnel)* Activez **Aperçu en direct** (section 7) pour voir le LOD choisi en wireframe par-dessus l'objet, recalculé à chaque changement de réglage, avant de générer.
+5. Cliquez sur **Générer les LODs**. Une barre de progression indique l'étape en cours ; **Échap** ou **Annuler** interrompt la génération (les LODs déjà terminés sont conservés si l'option est cochée).
+6. Contrôlez les niveaux générés avec la **Vue éclatée** ou la **Simulation de distance caméra**.
+7. Exportez vers le format de votre moteur cible (`FBX` ou `glTF`).
+
+> **Mise à jour de l'addon :** si une ancienne version est encore chargée en mémoire après l'installation d'un nouveau zip, un bandeau rouge l'indique en haut du panneau, avec un bouton **Recharger l'addon**. La version active est affichée dans l'en-tête du panneau.
 
 ---
 

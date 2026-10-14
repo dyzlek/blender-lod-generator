@@ -94,6 +94,19 @@ def find_nearest_same_side(bvh: BVHTree, co: Vector, ref_normal: Vector, max_rad
     return None, None, None, None
 
 
+# Number of faces processed between two progress yields in long Python loops
+PROGRESS_BATCH = 2000
+
+
+def run_steps(steps):
+    """Runs a step generator to completion and returns its final value."""
+    while True:
+        try:
+            next(steps)
+        except StopIteration as stop:
+            return stop.value
+
+
 def _search_radius(obj: bpy.types.Object) -> float:
     """Maximum search distance for same-side queries (a quarter of the bounding radius)."""
     _, radius = calculate_coords_bounding_sphere([v.co for v in obj.data.vertices])
@@ -169,12 +182,18 @@ def unfold_and_harmonize_shading(target_obj: bpy.types.Object, lod0_obj: bpy.typ
 
 
 def transfer_lod0_normals(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
+    """Synchronous wrapper of iter_transfer_lod0_normals."""
+    return run_steps(iter_transfer_lod0_normals(target_obj, lod0_obj))
+
+
+def iter_transfer_lod0_normals(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object):
     """
     Transfers LOD0 corner normals onto the LOD as custom split normals, sampling only
     LOD0 faces oriented like each target face (barycentric interpolation on the hit
     triangle). Replaces the Data Transfer modifier, whose nearest-face mapping picks
     the opposite wall on thin double-walled meshes and paints dark inverted patches.
-    Returns the number of corners that fell back to their own face normal.
+    Yields progress fractions (0..1) every PROGRESS_BATCH faces and returns the
+    number of corners that fell back to their own face normal.
     """
     if not target_obj or not lod0_obj:
         return 0
@@ -203,29 +222,33 @@ def transfer_lod0_normals(target_obj: bpy.types.Object, lod0_obj: bpy.types.Obje
 
     normals = [Vector((0.0, 0.0, 1.0))] * len(me.loops)
     fallbacks = 0
-    for f, poly in zip(bm.faces, me.polygons):
-        center = f.calc_center_median()
-        for loop, loop_index in zip(f.loops, poly.loop_indices):
-            co = loop.vert.co
-            # Sample slightly inside the face so hard edges pick the face on the right side
-            _, _, idx, _ = find_nearest_same_side(bvh0, co.lerp(center, 0.1), f.normal, max_radius)
-            if idx is None:
-                normals[loop_index] = f.normal.copy()
-                fallbacks += 1
-                continue
-            tri = bm0.faces[idx]
-            n = barycentric_transform(
-                co,
-                tri.verts[0].co, tri.verts[1].co, tri.verts[2].co,
-                tri.loops[0][nor_layer], tri.loops[1][nor_layer], tri.loops[2][nor_layer],
-            )
-            if n.length < 1e-6 or n.dot(f.normal) <= 0.0:
-                n = f.normal.copy()
-                fallbacks += 1
-            normals[loop_index] = n.normalized()
-
-    bm0.free()
-    bm.free()
+    total_faces = max(1, len(bm.faces))
+    try:
+        for face_index, (f, poly) in enumerate(zip(bm.faces, me.polygons)):
+            if face_index % PROGRESS_BATCH == 0:
+                yield face_index / total_faces
+            center = f.calc_center_median()
+            for loop, loop_index in zip(f.loops, poly.loop_indices):
+                co = loop.vert.co
+                # Sample slightly inside the face so hard edges pick the face on the right side
+                _, _, idx, _ = find_nearest_same_side(bvh0, co.lerp(center, 0.1), f.normal, max_radius)
+                if idx is None:
+                    normals[loop_index] = f.normal.copy()
+                    fallbacks += 1
+                    continue
+                tri = bm0.faces[idx]
+                n = barycentric_transform(
+                    co,
+                    tri.verts[0].co, tri.verts[1].co, tri.verts[2].co,
+                    tri.loops[0][nor_layer], tri.loops[1][nor_layer], tri.loops[2][nor_layer],
+                )
+                if n.length < 1e-6 or n.dot(f.normal) <= 0.0:
+                    n = f.normal.copy()
+                    fallbacks += 1
+                normals[loop_index] = n.normalized()
+    finally:
+        bm0.free()
+        bm.free()
 
     me.normals_split_custom_set(normals)
     me.update()
@@ -233,9 +256,15 @@ def transfer_lod0_normals(target_obj: bpy.types.Object, lod0_obj: bpy.types.Obje
 
 
 def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object) -> int:
+    """Synchronous wrapper of iter_repair_corrupted_uvs_via_bvh."""
+    return run_steps(iter_repair_corrupted_uvs_via_bvh(target_obj, lod0_obj))
+
+
+def iter_repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.types.Object):
     """
     Scans the decimated mesh for strictly degenerate UV faces (zero UV area)
     and re-projects barycentric UVs using the exact hit face on a triangulated LOD0 BVHTree.
+    Yields progress fractions (0..1) and returns the number of repaired faces.
     """
     if not target_obj or not lod0_obj or not target_obj.data.uv_layers:
         return 0
@@ -268,46 +297,49 @@ def repair_corrupted_uvs_via_bvh(target_obj: bpy.types.Object, lod0_obj: bpy.typ
         return 0
 
     repaired_count = 0
+    total_faces = max(1, len(bm_target.faces))
+    try:
+        for face_index, f in enumerate(bm_target.faces):
+            if face_index % PROGRESS_BATCH == 0:
+                yield face_index / total_faces
+            if len(f.verts) != 3:
+                continue
 
-    for f in bm_target.faces:
-        if len(f.verts) != 3:
-            continue
+            v0, v1, v2 = f.verts[0].co, f.verts[1].co, f.verts[2].co
+            lp0, lp1, lp2 = f.loops[0], f.loops[1], f.loops[2]
+            uv0, uv1, uv2 = lp0[uv_layer_target].uv, lp1[uv_layer_target].uv, lp2[uv_layer_target].uv
 
-        v0, v1, v2 = f.verts[0].co, f.verts[1].co, f.verts[2].co
-        lp0, lp1, lp2 = f.loops[0], f.loops[1], f.loops[2]
-        uv0, uv1, uv2 = lp0[uv_layer_target].uv, lp1[uv_layer_target].uv, lp2[uv_layer_target].uv
+            area_uv = abs(calculate_uv_signed_area(uv0, uv1, uv2))
+            area_3d = calculate_triangle_3d_area(v0, v1, v2)
 
-        area_uv = abs(calculate_uv_signed_area(uv0, uv1, uv2))
-        area_3d = calculate_triangle_3d_area(v0, v1, v2)
+            max_uv_edge = max((uv1 - uv0).length, (uv2 - uv1).length, (uv0 - uv2).length)
+            is_barcode = (max_uv_edge > 1e-3 and (2.0 * area_uv / (max_uv_edge ** 2)) < 1e-6)
+            is_zero_uv = (area_uv < 1e-11 and area_3d > 1e-5)
 
-        max_uv_edge = max((uv1 - uv0).length, (uv2 - uv1).length, (uv0 - uv2).length)
-        is_barcode = (max_uv_edge > 1e-3 and (2.0 * area_uv / (max_uv_edge ** 2)) < 1e-6)
-        is_zero_uv = (area_uv < 1e-11 and area_3d > 1e-5)
+            if is_barcode or is_zero_uv:
+                face_center = (v0 + v1 + v2) / 3.0
+                for loop in f.loops:
+                    # Sample slightly inward toward face center and use the EXACT hit face (hit_face_idx)
+                    sample_pt = loop.vert.co.lerp(face_center, 0.15)
+                    loc, _, hit_face_idx, _ = find_nearest_same_side(bvh0, sample_pt, f.normal, max_radius)
+                    if loc is not None and hit_face_idx is not None and hit_face_idx < len(bm0.faces):
+                        f_hit = bm0.faces[hit_face_idx]
+                        pA, pB, pC = f_hit.verts[0].co, f_hit.verts[1].co, f_hit.verts[2].co
+                        uvA = Vector((f_hit.loops[0][uv_layer0].uv.x, f_hit.loops[0][uv_layer0].uv.y, 0.0))
+                        uvB = Vector((f_hit.loops[1][uv_layer0].uv.x, f_hit.loops[1][uv_layer0].uv.y, 0.0))
+                        uvC = Vector((f_hit.loops[2][uv_layer0].uv.x, f_hit.loops[2][uv_layer0].uv.y, 0.0))
 
-        if is_barcode or is_zero_uv:
-            face_center = (v0 + v1 + v2) / 3.0
-            for loop in f.loops:
-                # Sample slightly inward toward face center and use the EXACT hit face (hit_face_idx)
-                sample_pt = loop.vert.co.lerp(face_center, 0.15)
-                loc, _, hit_face_idx, _ = find_nearest_same_side(bvh0, sample_pt, f.normal, max_radius)
-                if loc is not None and hit_face_idx is not None and hit_face_idx < len(bm0.faces):
-                    f_hit = bm0.faces[hit_face_idx]
-                    pA, pB, pC = f_hit.verts[0].co, f_hit.verts[1].co, f_hit.verts[2].co
-                    uvA = Vector((f_hit.loops[0][uv_layer0].uv.x, f_hit.loops[0][uv_layer0].uv.y, 0.0))
-                    uvB = Vector((f_hit.loops[1][uv_layer0].uv.x, f_hit.loops[1][uv_layer0].uv.y, 0.0))
-                    uvC = Vector((f_hit.loops[2][uv_layer0].uv.x, f_hit.loops[2][uv_layer0].uv.y, 0.0))
+                        uv_repaired = barycentric_transform(loc, pA, pB, pC, uvA, uvB, uvC)
+                        loop[uv_layer_target].uv = uv_repaired.xy
 
-                    uv_repaired = barycentric_transform(loc, pA, pB, pC, uvA, uvB, uvC)
-                    loop[uv_layer_target].uv = uv_repaired.xy
+                repaired_count += 1
 
-            repaired_count += 1
-
-    if repaired_count > 0:
-        bm_target.to_mesh(target_obj.data)
-        target_obj.data.update()
-
-    bm0.free()
-    bm_target.free()
+        if repaired_count > 0:
+            bm_target.to_mesh(target_obj.data)
+            target_obj.data.update()
+    finally:
+        bm0.free()
+        bm_target.free()
     return repaired_count
 
 
@@ -349,7 +381,26 @@ def apply_modifier_safely(context, obj: bpy.types.Object, mod_name: str) -> bool
     return success
 
 
-def generate_lod_mesh(
+def _scaled(steps, label: str, start: float, end: float):
+    """Re-yields a sub-generator's 0..1 fractions as (label, fraction) mapped into [start, end]."""
+    while True:
+        try:
+            fraction = next(steps)
+        except StopIteration as stop:
+            return stop.value
+        try:
+            yield label, start + (end - start) * fraction
+        except GeneratorExit:
+            steps.close()
+            raise
+
+
+def generate_lod_mesh(*args, **kwargs) -> tuple[bpy.types.Object, dict]:
+    """Synchronous wrapper of iter_generate_lod_mesh (scripting, tests, Redo panel)."""
+    return run_steps(iter_generate_lod_mesh(*args, **kwargs))
+
+
+def iter_generate_lod_mesh(
     context,
     source_obj: bpy.types.Object,
     lod0_obj: bpy.types.Object,
@@ -375,9 +426,13 @@ def generate_lod_mesh(
     cull_threshold_pct: float = 2.5,
     normal_strategy: str = 'TRANSFER',
     keep_protection_mask: bool = False
-) -> tuple[bpy.types.Object, dict]:
+):
     """
     Executes the complete generation of a single LOD level from a source mesh.
+    Generator: yields (step label, fraction 0..1 of this LOD) between passes so a
+    modal operator can show progress and cancel; returns (lod_object, stats).
+    If the generator is closed (cancel) or a pass raises, the partial LOD object
+    and its mesh are removed so nothing is left behind.
     """
     # 1. Clean duplication (keep identical local space with lod0_obj)
     new_mesh = source_obj.data.copy()
@@ -388,141 +443,165 @@ def generate_lod_mesh(
     new_obj.modifiers.clear()
 
     context.collection.objects.link(new_obj)
+    try:
+        yield "Préparation", 0.02
+        # Clear pre-existing custom normals so BMesh operations don't corrupt tangent loop normals
+        clear_custom_normals_safely(context, new_obj)
 
-    # Clear pre-existing custom normals so BMesh operations don't corrupt tangent loop normals
-    clear_custom_normals_safely(context, new_obj)
+        yield "Pré-triangulation", 0.05
+        # 2. Pass 0 — Clean Pre-Triangulation
+        if pre_triangulate:
+            mod_tri = new_obj.modifiers.new(name="LOD_Pre_Triangulate", type='TRIANGULATE')
+            mod_tri.quad_method = 'BEAUTY'
+            mod_tri.ngon_method = 'CLIP'
+            mod_tri.keep_custom_normals = False
+            apply_modifier_safely(context, new_obj, mod_tri.name)
 
-    # 2. Pass 0 — Clean Pre-Triangulation
-    if pre_triangulate:
-        mod_tri = new_obj.modifiers.new(name="LOD_Pre_Triangulate", type='TRIANGULATE')
-        mod_tri.quad_method = 'BEAUTY'
-        mod_tri.ngon_method = 'CLIP'
-        mod_tri.keep_custom_normals = False
-        apply_modifier_safely(context, new_obj, mod_tri.name)
+        yield "Culling des petits fragments", 0.1
+        # 3. Geometry Culling for small detached components on distant LODs
+        culled_islands = 0
+        if cull_small_parts and lod_level >= 2:
+            effective_cull_pct = cull_threshold_pct
+            if lod_level >= 3:
+                effective_cull_pct = max(effective_cull_pct, 5.0)
+            culled_islands = cull_small_islands_from_object(new_obj, effective_cull_pct)
 
-    # 3. Geometry Culling for small detached components on distant LODs
-    culled_islands = 0
-    if cull_small_parts and lod_level >= 2:
-        effective_cull_pct = cull_threshold_pct
-        if lod_level >= 3:
-            effective_cull_pct = max(effective_cull_pct, 5.0)
-        culled_islands = cull_small_islands_from_object(new_obj, effective_cull_pct)
+        yield "Dissolution planaire", 0.12
+        # 4. Pass 1 — Coplanar Face Dissolve (Planar Pre-Decimate)
+        if pre_planar_dissolve:
+            mod_planar = new_obj.modifiers.new(name="LOD_Planar_Dissolve", type='DECIMATE')
+            mod_planar.decimate_type = 'DISSOLVE'
+            mod_planar.angle_limit = planar_angle_limit_rad
+            mod_planar.delimit = {'UV', 'MATERIAL', 'SEAM', 'SHARP'}
+            apply_modifier_safely(context, new_obj, mod_planar.name)
 
-    # 4. Pass 1 — Coplanar Face Dissolve (Planar Pre-Decimate)
-    if pre_planar_dissolve:
-        mod_planar = new_obj.modifiers.new(name="LOD_Planar_Dissolve", type='DECIMATE')
-        mod_planar.decimate_type = 'DISSOLVE'
-        mod_planar.angle_limit = planar_angle_limit_rad
-        mod_planar.delimit = {'UV', 'MATERIAL', 'SEAM', 'SHARP'}
-        apply_modifier_safely(context, new_obj, mod_planar.name)
-
-    # 5. Pre-mark UV discontinuities as seams & weld sawtooth pole UVs
-    if use_delimit_uv and new_obj.data.uv_layers:
-        bm_seam = bmesh.new()
-        bm_seam.from_mesh(new_obj.data)
-        mark_uv_discontinuities_as_seams(bm_seam)
-        bm_seam.to_mesh(new_obj.data)
-        new_obj.data.update()
-        bm_seam.free()
-
-    # 6. Optional Split-Decimate-Weld Physical Isolation
-    if split_weld_isolation:
-        bm_split = bmesh.new()
-        bm_split.from_mesh(new_obj.data)
-        bm_split.edges.ensure_lookup_table()
-        seam_edges = [e for e in bm_split.edges if e.seam]
-        if seam_edges:
-            bmesh.ops.split_edges(bm_split, edges=seam_edges)
-            bm_split.to_mesh(new_obj.data)
+        yield "Marquage des coutures UV", 0.15
+        # 5. Pre-mark UV discontinuities as seams & weld sawtooth pole UVs
+        if use_delimit_uv and new_obj.data.uv_layers:
+            bm_seam = bmesh.new()
+            bm_seam.from_mesh(new_obj.data)
+            mark_uv_discontinuities_as_seams(bm_seam)
+            bm_seam.to_mesh(new_obj.data)
             new_obj.data.update()
-        bm_split.free()
+            bm_seam.free()
 
-    # 7. Generate Procedural Protection Weight Mask
-    apply_protection_mask_to_object(
-        obj=new_obj,
-        preserve_uv=preserve_uv,
-        preserve_silhouette=preserve_silhouette,
-        silhouette_angle_rad=silhouette_angle_rad,
-        preserve_boundary=preserve_boundary,
-        preserve_material=preserve_material,
-        preserve_skinning=preserve_skinning,
-        uv_border_curvature=uv_border_curvature,
-        lod_level=lod_level,
-        relax_weights=relax_weights
-    )
+        # 6. Optional Split-Decimate-Weld Physical Isolation
+        if split_weld_isolation:
+            bm_split = bmesh.new()
+            bm_split.from_mesh(new_obj.data)
+            bm_split.edges.ensure_lookup_table()
+            seam_edges = [e for e in bm_split.edges if e.seam]
+            if seam_edges:
+                bmesh.ops.split_edges(bm_split, edges=seam_edges)
+                bm_split.to_mesh(new_obj.data)
+                new_obj.data.update()
+            bm_split.free()
 
-    # 8. Pass 2 — QEM Guided Collapse Decimation with Delimit Barrier
-    target_triangles = max(8, int(original_lod0_triangles * target_ratio))
-    current_triangles = get_triangulated_face_count(new_obj)
+        yield "Carte de protection", 0.2
+        # 7. Generate Procedural Protection Weight Mask
+        apply_protection_mask_to_object(
+            obj=new_obj,
+            preserve_uv=preserve_uv,
+            preserve_silhouette=preserve_silhouette,
+            silhouette_angle_rad=silhouette_angle_rad,
+            preserve_boundary=preserve_boundary,
+            preserve_material=preserve_material,
+            preserve_skinning=preserve_skinning,
+            uv_border_curvature=uv_border_curvature,
+            lod_level=lod_level,
+            relax_weights=relax_weights
+        )
 
-    if current_triangles > target_triangles:
-        eff_collapse_ratio = clamp(target_triangles / max(1, current_triangles), 0.002, 1.0)
-        mod_qem = new_obj.modifiers.new(name="LOD_QEM_Collapse", type='DECIMATE')
-        mod_qem.decimate_type = 'COLLAPSE'
-        mod_qem.ratio = eff_collapse_ratio
-        mod_qem.use_collapse_triangulate = False
-        mod_qem.vertex_group = PROTECTION_VG_NAME
-        mod_qem.invert_vertex_group = True
-        mod_qem.vertex_group_factor = 0.50
+        yield "Décimation QEM", 0.35
+        # 8. Pass 2 — QEM Guided Collapse Decimation with Delimit Barrier
+        target_triangles = max(8, int(original_lod0_triangles * target_ratio))
+        current_triangles = get_triangulated_face_count(new_obj)
 
-        if use_delimit_uv:
-            mod_qem.delimit = {'UV', 'MATERIAL', 'SEAM'}
+        if current_triangles > target_triangles:
+            eff_collapse_ratio = clamp(target_triangles / max(1, current_triangles), 0.002, 1.0)
+            mod_qem = new_obj.modifiers.new(name="LOD_QEM_Collapse", type='DECIMATE')
+            mod_qem.decimate_type = 'COLLAPSE'
+            mod_qem.ratio = eff_collapse_ratio
+            mod_qem.use_collapse_triangulate = False
+            mod_qem.vertex_group = PROTECTION_VG_NAME
+            mod_qem.invert_vertex_group = True
+            mod_qem.vertex_group_factor = 0.50
 
-        apply_modifier_safely(context, new_obj, mod_qem.name)
+            if use_delimit_uv:
+                mod_qem.delimit = {'UV', 'MATERIAL', 'SEAM'}
 
-    # 9. Re-weld after Split if isolation was active
-    if split_weld_isolation:
-        bm_weld = bmesh.new()
-        bm_weld.from_mesh(new_obj.data)
-        bm_weld.verts.ensure_lookup_table()
-        bmesh.ops.remove_doubles(bm_weld, verts=bm_weld.verts, dist=0.00001)
-        bm_weld.to_mesh(new_obj.data)
+            apply_modifier_safely(context, new_obj, mod_qem.name)
+
+        # 9. Re-weld after Split if isolation was active
+        if split_weld_isolation:
+            bm_weld = bmesh.new()
+            bm_weld.from_mesh(new_obj.data)
+            bm_weld.verts.ensure_lookup_table()
+            bmesh.ops.remove_doubles(bm_weld, verts=bm_weld.verts, dist=0.00001)
+            bm_weld.to_mesh(new_obj.data)
+            new_obj.data.update()
+            bm_weld.free()
+
+        yield "Dépliage des faces repliées", 0.6
+        # 10. Unfold any folded triangles and harmonize manifold winding & smooth shading
+        if lod0_obj:
+            unfold_and_harmonize_shading(new_obj, lod0_obj)
+
+        # 11. Pass 3 — Post-Decimation UV Repair via BVH Tree
+        repaired_uvs = 0
+        if bvh_repair_uv and lod0_obj:
+            repaired_uvs = yield from _scaled(
+                iter_repair_corrupted_uvs_via_bvh(new_obj, lod0_obj), "Réparation des UVs", 0.66, 0.78)
+
+        # Validate mesh BEFORE Data Transfer so custom split normals are written onto valid loops
+        new_obj.data.validate()
         new_obj.data.update()
-        bm_weld.free()
 
-    # 10. Unfold any folded triangles and harmonize manifold winding & smooth shading
-    if lod0_obj:
-        unfold_and_harmonize_shading(new_obj, lod0_obj)
+        yield "Restauration des normales", 0.8
+        # 12. Pass 4 — Shading Restoration (Custom Normal Transfer)
+        if normal_strategy == 'TRANSFER' and lod0_obj:
+            yield from _scaled(
+                iter_transfer_lod0_normals(new_obj, lod0_obj), "Transfert des normales", 0.80, 0.98)
 
-    # 11. Pass 3 — Post-Decimation UV Repair via BVH Tree
-    repaired_uvs = 0
-    if bvh_repair_uv and lod0_obj:
-        repaired_uvs = repair_corrupted_uvs_via_bvh(new_obj, lod0_obj)
+        elif normal_strategy == 'WEIGHTED':
+            mod_wn = new_obj.modifiers.new(name="LOD_Weighted_Normal", type='WEIGHTED_NORMAL')
+            mod_wn.keep_sharp = True
+            apply_modifier_safely(context, new_obj, mod_wn.name)
 
-    # Validate mesh BEFORE Data Transfer so custom split normals are written onto valid loops
-    new_obj.data.validate()
-    new_obj.data.update()
+        # 13. Clean up temporary vertex group
+        if not keep_protection_mask and PROTECTION_VG_NAME in new_obj.vertex_groups:
+            vg = new_obj.vertex_groups.get(PROTECTION_VG_NAME)
+            new_obj.vertex_groups.remove(vg)
 
-    # 12. Pass 4 — Shading Restoration (Custom Normal Transfer)
-    if normal_strategy == 'TRANSFER' and lod0_obj:
-        transfer_lod0_normals(new_obj, lod0_obj)
+        new_obj.data.update()
 
-    elif normal_strategy == 'WEIGHTED':
-        mod_wn = new_obj.modifiers.new(name="LOD_Weighted_Normal", type='WEIGHTED_NORMAL')
-        mod_wn.keep_sharp = True
-        apply_modifier_safely(context, new_obj, mod_wn.name)
+        final_triangles = get_triangulated_face_count(new_obj)
+        reduction_pct = (1.0 - (final_triangles / max(1, original_lod0_triangles))) * 100.0
 
-    # 13. Clean up temporary vertex group
-    if not keep_protection_mask and PROTECTION_VG_NAME in new_obj.vertex_groups:
-        vg = new_obj.vertex_groups.get(PROTECTION_VG_NAME)
-        new_obj.vertex_groups.remove(vg)
+        stats = {
+            "lod_level": lod_level,
+            "lod_name": lod_name,
+            "triangles": final_triangles,
+            "target_triangles": target_triangles,
+            "reduction_pct": round(reduction_pct, 1),
+            "culled_islands": culled_islands,
+            "repaired_uvs": repaired_uvs
+        }
 
-    new_obj.data.update()
-
-    final_triangles = get_triangulated_face_count(new_obj)
-    reduction_pct = (1.0 - (final_triangles / max(1, original_lod0_triangles))) * 100.0
-
-    stats = {
-        "lod_level": lod_level,
-        "lod_name": lod_name,
-        "triangles": final_triangles,
-        "target_triangles": target_triangles,
-        "reduction_pct": round(reduction_pct, 1),
-        "culled_islands": culled_islands,
-        "repaired_uvs": repaired_uvs
-    }
-
-    return new_obj, stats
+        yield "Terminé", 1.0
+        return new_obj, stats
+    except BaseException:
+        # Cancel (GeneratorExit) or failure: never leave a half-built LOD behind
+        try:
+            bpy.data.objects.remove(new_obj, do_unlink=True)
+        except ReferenceError:
+            pass
+        try:
+            if new_mesh.users == 0:
+                bpy.data.meshes.remove(new_mesh)
+        except ReferenceError:
+            pass
+        raise
 
 # Alias de retrocompatibilite
 fix_flipped_faces_and_smoothing = unfold_and_harmonize_shading

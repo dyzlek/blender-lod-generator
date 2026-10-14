@@ -13,7 +13,16 @@ from bpy.props import (
     StringProperty,
     CollectionProperty,
     PointerProperty,
+    FloatVectorProperty,
 )
+
+
+def _update_preview_enabled(self, context):
+    from .ui import hud_overlay
+    if self.preview_enabled:
+        hud_overlay.start_preview()
+    else:
+        hud_overlay.stop_preview()
 
 
 class LODStatItem(bpy.types.PropertyGroup):
@@ -265,6 +274,44 @@ class LODGeneratorSettings(bpy.types.PropertyGroup):
             ('GLTF', "glTF (.glb)", "Standard Godot & WebXR")
         ],
         default='FBX'
+    )
+
+    # --- Aperçu en direct (wireframe superposé à LOD0) ---
+    preview_enabled: BoolProperty(
+        name="Aperçu en direct",
+        description="Dessine en wireframe le LOD choisi par-dessus l'objet actif, recalculé à chaque changement de réglage",
+        default=False,
+        update=_update_preview_enabled
+    )
+
+    preview_level: IntProperty(
+        name="Niveau d'aperçu",
+        description="Niveau de LOD prévisualisé",
+        default=1,
+        min=1,
+        max=6
+    )
+
+    preview_color: FloatVectorProperty(
+        name="Couleur",
+        description="Couleur du wireframe d'aperçu",
+        subtype='COLOR_GAMMA',
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 0.55, 0.1, 0.9)
+    )
+
+    # --- Progression de la génération (opérateur modal) ---
+    is_generating: BoolProperty(default=False)
+    generation_progress: FloatProperty(default=0.0, min=0.0, max=1.0, subtype='FACTOR')
+    generation_label: StringProperty(default="")
+    cancel_requested: BoolProperty(default=False)
+
+    cancel_keep_completed: BoolProperty(
+        name="Garder les LODs terminés si annulé",
+        description="En cas d'annulation, conserve les niveaux déjà générés (sinon tout est retiré)",
+        default=True
     )
 
     # --- Données de session ---
